@@ -224,6 +224,19 @@ def test_transcribe_keeps_progress_on_stderr_without_profiling_sync(
     assert "[muscriptor] audio:" in captured.err
 
 
+def test_transcribe_can_suppress_progress_output_for_benchmarks(capsys):
+    events = list(
+        _MinimalTranscriber().transcribe(
+            (torch.zeros(1, 100), 16_000),
+            log_progress=False,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert len(events) == 1
+    assert (captured.out, captured.err) == ("", "")
+
+
 def test_transcribe_forwards_profile_to_token_generation(monkeypatch):
     monkeypatch.setattr(
         "muscriptor.transcription_model.muscriptor.accelerator.synchronize",

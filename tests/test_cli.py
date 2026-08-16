@@ -61,6 +61,7 @@ class _RealMidiMethodModel(_FakeModel):
     @staticmethod
     def events_to_midi_bytes(_events, *, beat_grid):
         assert beat_grid is None
+        list(_events)
         return b"FAKE_MIDI"
 
 
@@ -165,6 +166,15 @@ def test_profile_flag_works_with_the_real_midi_method(
 
     assert result.exit_code == 0, result.output
     assert output.read_bytes() == b"FAKE_MIDI"
+
+
+def test_real_midi_method_forwards_log_progress():
+    model = _RealMidiMethodModel()
+
+    result = model.transcribe_to_midi(audio="fake.wav", log_progress=False)
+
+    assert result == b"FAKE_MIDI"
+    assert _RealMidiMethodModel.last_kwargs["log_progress"] is False
 
 
 def test_serve_profile_flag_is_forwarded_to_the_app(monkeypatch):

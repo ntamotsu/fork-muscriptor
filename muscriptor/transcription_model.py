@@ -329,6 +329,7 @@ class TranscriptionModel:
         beam_size: int = 1,
         prelude_forcing: bool = True,
         profile: bool = False,
+        log_progress: bool = True,
     ) -> Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent]:
         """Transcribe audio into a stream of note events.
 
@@ -391,10 +392,11 @@ class TranscriptionModel:
         segment_samples = int(_SEGMENT_DURATION * _SAMPLE_RATE)
         num_chunks = math.ceil(total_samples / segment_samples)
         max_gen_len = 2000
-        print(
-            f"[muscriptor] audio: {total_duration:.1f}s → {num_chunks} chunk(s) of {_SEGMENT_DURATION}s",
-            file=sys.stderr,
-        )
+        if log_progress:
+            print(
+                f"[muscriptor] audio: {total_duration:.1f}s → {num_chunks} chunk(s) of {_SEGMENT_DURATION}s",
+                file=sys.stderr,
+            )
 
         with profile_timed(profile, "build conditions", device=self._device):
             all_conditions: list[ConditioningAttributes] = []
@@ -604,6 +606,7 @@ class TranscriptionModel:
         prelude_forcing: bool = True,
         detect_tempo: TempoDetection = "best-effort",
         profile: bool = False,
+        log_progress: bool = True,
     ) -> bytes:
         """Same as :meth:`transcribe` but returns a MIDI file as bytes."""
         beat_grid = self.detect_beat_grid_for(audio, detect_tempo)
@@ -618,6 +621,7 @@ class TranscriptionModel:
             beam_size=beam_size,
             prelude_forcing=prelude_forcing,
             profile=profile,
+            log_progress=log_progress,
         )
         return self.events_to_midi_bytes(events, beat_grid=beat_grid)
 

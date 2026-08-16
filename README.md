@@ -170,6 +170,9 @@ uv run muscriptor transcribe path/to/audio_file.wav
 
 Again, see `--help` for more options.
 
+For repeatable performance measurements and output-equivalence checks, see
+[BENCHMARKING.md](BENCHMARKING.md).
+
 ## License
 
 The code in this repository is released under the [MIT license](LICENSE).

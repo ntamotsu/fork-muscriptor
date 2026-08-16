@@ -52,6 +52,7 @@ Issues = "https://github.com/muscriptor/muscriptor/issues"
 
 [project.scripts]
 muscriptor = "muscriptor.main:main"
+muscriptor-benchmark = "muscriptor.benchmark_cli:main"
 
 [tool.hatch.build]
 # The built frontend is gitignored but must ship in the sdist/wheel so that
