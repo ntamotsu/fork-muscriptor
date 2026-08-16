@@ -176,15 +176,16 @@ def test_missing_eos_warns_and_still_emits_when_allowed():
 # ---------------------------------------------------------------------------
 
 
-class _FakeAudio:
+class _FakeAudio(TranscriptionModel):
     """Just enough of a model for detect_beat_grid_for's mode dispatch."""
 
     _load_wav = staticmethod(lambda tensor, sr: tensor)
-    detect_beat_grid_for = TranscriptionModel.detect_beat_grid_for
+
+    def __init__(self):
+        pass
 
 
-class _MinimalTranscriber:
-    transcribe = TranscriptionModel.transcribe
+class _MinimalTranscriber(TranscriptionModel):
     _device = torch.device("cpu")
     _tokenizer = SimpleNamespace(_vocab=[], frame_rate=100)
     _instrument_for_program = staticmethod(lambda _program: "piano")
@@ -207,6 +208,28 @@ class _MinimalTranscriber:
     def _generate_token_stream(self, *_args, profile=False, **_kwargs):
         self.profile_seen = profile
         return iter(())
+
+
+class _PreparedAudioRecorder(_MinimalTranscriber):
+    def __init__(self):
+        super().__init__()
+        self.load_calls = 0
+        self.prepared = torch.ones(1, 100)
+        self.transcription_wavs = []
+
+    def _load_wav(self, _audio, _sample_rate):
+        self.load_calls += 1
+        return self.prepared
+
+    def _transcribe_prepared(self, wav, **_kwargs):
+        self.transcription_wavs.append(wav)
+        yield ProgressEvent(completed=0, total=0)
+
+    @staticmethod
+    def events_to_midi_bytes(events, *, beat_grid):
+        list(events)
+        assert beat_grid == "beat-grid"
+        return b"MIDI"
 
 
 def test_transcribe_keeps_progress_on_stderr_without_profiling_sync(
@@ -235,6 +258,39 @@ def test_transcribe_can_suppress_progress_output_for_benchmarks(capsys):
     captured = capsys.readouterr()
     assert len(events) == 1
     assert (captured.out, captured.err) == ("", "")
+
+
+def test_transcribe_remains_lazy_when_using_a_prepared_audio_path():
+    model = _PreparedAudioRecorder()
+
+    events = model.transcribe((torch.zeros(1, 100), 16_000), log_progress=False)
+
+    assert model.load_calls == 0
+    assert list(events) == [ProgressEvent(completed=0, total=0)]
+    assert model.load_calls == 1
+    assert model.transcription_wavs == [model.prepared]
+
+
+def test_midi_prepares_audio_once_and_shares_the_same_tensor(monkeypatch):
+    model = _PreparedAudioRecorder()
+    beat_wavs = []
+
+    def fake_detect_grid(wav, _sample_rate):
+        beat_wavs.append(wav)
+        return "beat-grid"
+
+    monkeypatch.setattr("muscriptor.transcription_model.detect_grid", fake_detect_grid)
+
+    result = model.transcribe_to_midi(
+        (torch.zeros(2, 44_100), 44_100),
+        detect_tempo=True,
+        log_progress=False,
+    )
+
+    assert result == b"MIDI"
+    assert model.load_calls == 1
+    assert beat_wavs == [model.prepared]
+    assert model.transcription_wavs == [model.prepared]
 
 
 def test_transcribe_forwards_profile_to_token_generation(monkeypatch):

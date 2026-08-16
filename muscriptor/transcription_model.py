@@ -363,6 +363,37 @@ class TranscriptionModel:
         ``completed == 0``, then one as each chunk finishes. Consumers that
         only care about notes can ignore them.
         """
+        with profile_timed(profile, "load audio", device=self._device):
+            wav = self._prepare_audio(audio)
+        yield from self._transcribe_prepared(
+            wav,
+            use_sampling=use_sampling,
+            temperature=temperature,
+            cfg_coef=cfg_coef,
+            instruments=instruments,
+            batch_size=batch_size,
+            no_eos_is_ok=no_eos_is_ok,
+            beam_size=beam_size,
+            prelude_forcing=prelude_forcing,
+            profile=profile,
+            log_progress=log_progress,
+        )
+
+    def _transcribe_prepared(
+        self,
+        wav: torch.Tensor,
+        use_sampling: bool = False,
+        temperature: float = 1.0,
+        cfg_coef: float = 1.0,
+        instruments: list[str] | None = None,
+        batch_size: int | None = None,
+        no_eos_is_ok: bool = True,
+        beam_size: int = 1,
+        prelude_forcing: bool = True,
+        profile: bool = False,
+        log_progress: bool = True,
+    ) -> Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent]:
+        """canonicalize済みの音声から採譜eventを生成する。"""
         batch_size = self._resolve_batch_size(batch_size, prelude_forcing)
 
         # Exact names only here — the CLI resolves abbreviations before
@@ -377,14 +408,6 @@ class TranscriptionModel:
                 device=self._device,
                 dtype=torch.long,
             )
-
-        if isinstance(audio, tuple):
-            tensor, sample_rate = audio
-            with profile_timed(profile, "load audio", device=self._device):
-                wav = self._load_wav(tensor, sample_rate)
-        else:
-            with profile_timed(profile, "load audio", device=self._device):
-                wav = self._load_wav(audio, None)
 
         total_samples = wav.shape[-1]
         total_duration = total_samples / _SAMPLE_RATE
@@ -609,9 +632,11 @@ class TranscriptionModel:
         log_progress: bool = True,
     ) -> bytes:
         """Same as :meth:`transcribe` but returns a MIDI file as bytes."""
-        beat_grid = self.detect_beat_grid_for(audio, detect_tempo)
-        events = self.transcribe(
-            audio,
+        with profile_timed(profile, "load audio", device=self._device):
+            wav = self._prepare_audio(audio)
+        beat_grid = self._detect_beat_grid_prepared(wav, detect_tempo)
+        events = self._transcribe_prepared(
+            wav,
             use_sampling=use_sampling,
             temperature=temperature,
             cfg_coef=cfg_coef,
@@ -642,9 +667,18 @@ class TranscriptionModel:
         """
         if mode is False:
             return None
-        tensor, sample_rate = audio if isinstance(audio, tuple) else (audio, None)
+        return self._detect_beat_grid_prepared(self._prepare_audio(audio), mode)
+
+    def _detect_beat_grid_prepared(
+        self,
+        wav: torch.Tensor,
+        mode: TempoDetection,
+    ) -> BeatGrid | None:
+        """canonicalize済みの音声からbeat gridを検出する。"""
+        if mode is False:
+            return None
         try:
-            return detect_grid(self._load_wav(tensor, sample_rate), _SAMPLE_RATE)
+            return detect_grid(wav, _SAMPLE_RATE)
         except BeatDetectionError as e:
             if mode is True:
                 raise
@@ -717,6 +751,14 @@ class TranscriptionModel:
         raise ValueError(f"Unknown instrument name: {instrument!r}")
 
     # ------------------------------------------------------------------
+    def _prepare_audio(
+        self,
+        audio: str | Path | tuple[torch.Tensor, int],
+    ) -> torch.Tensor:
+        """公開APIの入力をcanonicalなwaveformへ一度だけ変換する。"""
+        tensor, sample_rate = audio if isinstance(audio, tuple) else (audio, None)
+        return self._load_wav(tensor, sample_rate)
+
     def _load_wav(
         self, audio: str | Path | torch.Tensor, sample_rate: int | None
     ) -> torch.Tensor:

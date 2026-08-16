@@ -9,6 +9,7 @@ import wave
 from pathlib import Path
 
 import pytest
+import torch
 from typer.testing import CliRunner
 
 import muscriptor.main as main_mod
@@ -50,8 +51,17 @@ class _FakeModel:
 
 class _RealMidiMethodModel(_FakeModel):
     transcribe_to_midi = main_mod.TranscriptionModel.transcribe_to_midi
+    _device = torch.device("cpu")
 
-    def transcribe(self, audio, **kwargs):
+    @staticmethod
+    def _prepare_audio(audio):
+        return audio
+
+    @staticmethod
+    def _detect_beat_grid_prepared(_audio, _detect_tempo):
+        return None
+
+    def _transcribe_prepared(self, audio, **kwargs):
         return super().transcribe(audio=audio, **kwargs)
 
     @staticmethod
