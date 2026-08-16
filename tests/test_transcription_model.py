@@ -8,9 +8,11 @@ generated.
 """
 
 import copy
+import inspect
 import pickle
 import sys
 import time
+from dataclasses import FrozenInstanceError
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Lock
 from types import ModuleType, SimpleNamespace
@@ -19,7 +21,7 @@ import pytest
 import torch
 
 from muscriptor.events import ChunkBoundary, ProgressEvent
-from muscriptor.transcription_model import TranscriptionModel
+from muscriptor.transcription_model import ChunkGenerationStats, TranscriptionModel
 from muscriptor.utils.beats import BeatDetectionError, _LazyAudio2Beats
 
 EOS = 99
@@ -32,6 +34,8 @@ def _run(
     seek_times,
     no_eos_is_ok=False,
     beam_size=1,
+    max_gen_len=64,
+    generation_observer=None,
     generate_calls=None,
     closed_calls=None,
 ):
@@ -66,7 +70,7 @@ def _run(
         conditions,
         seek_times,
         batch_size,
-        max_gen_len=64,
+        max_gen_len=max_gen_len,
         use_sampling=False,
         temperature=1.0,
         cfg_coef=2.0,
@@ -75,11 +79,12 @@ def _run(
         # (test_prelude_forcing.py).
         prelude_forcing=False,
         beam_size=beam_size,
+        _generation_observer=generation_observer,
     )
     return stream, pulled
 
 
-def _stream_from_steps(steps):
+def _stream_from_steps(steps, *, generation_observer=None):
     """既成のstep iteratorをfake model経由でtoken streamへ接続する。"""
     fake = SimpleNamespace(
         _model=SimpleNamespace(generate=lambda **_kwargs: steps),
@@ -96,6 +101,7 @@ def _stream_from_steps(steps):
         cfg_coef=2.0,
         no_eos_is_ok=False,
         prelude_forcing=False,
+        _generation_observer=generation_observer,
     )
 
 
@@ -173,6 +179,205 @@ def test_single_beam_stops_and_closes_after_staggered_eos():
     )
 
 
+def test_generation_stats_include_batch_work_after_an_earlier_eos():
+    rows = [[10, 20], [EOS, 21], [777, 22], [888, EOS]]
+    closed_calls = []
+    records = []
+
+    def observe(record):
+        # A complete record is published only after model generation is closed.
+        assert closed_calls == [True]
+        records.append(record)
+
+    stream, _ = _run(
+        [rows],
+        batch_size=2,
+        seek_times=[0.0, 5.0],
+        generation_observer=observe,
+        closed_calls=closed_calls,
+    )
+
+    list(stream)
+
+    assert records == [
+        ChunkGenerationStats(
+            chunk_index=0,
+            seek_time_us=0,
+            prompt_tokens=0,
+            observed_rows=4,
+            generated_rows=4,
+            eos_step=2,
+            max_gen_len=64,
+            hit_generation_limit=False,
+        ),
+        ChunkGenerationStats(
+            chunk_index=1,
+            seek_time_us=5_000_000,
+            prompt_tokens=0,
+            observed_rows=4,
+            generated_rows=4,
+            eos_step=4,
+            max_gen_len=64,
+            hit_generation_limit=False,
+        ),
+    ]
+    with pytest.raises(FrozenInstanceError):
+        records[0].chunk_index = 7
+
+
+def _valid_generation_stats_fields():
+    return {
+        "chunk_index": 0,
+        "seek_time_us": 0,
+        "prompt_tokens": 2,
+        "observed_rows": 6,
+        "generated_rows": 4,
+        "eos_step": 3,
+        "max_gen_len": 64,
+        "hit_generation_limit": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "chunk_index",
+        "seek_time_us",
+        "prompt_tokens",
+        "observed_rows",
+        "generated_rows",
+        "eos_step",
+        "max_gen_len",
+    ],
+)
+def test_generation_stats_integer_fields_reject_bool(field):
+    values = _valid_generation_stats_fields()
+    values[field] = True
+
+    with pytest.raises(TypeError, match=field):
+        ChunkGenerationStats(**values)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"chunk_index": -1}, "chunk_index"),
+        ({"seek_time_us": -1}, "seek_time_us"),
+        ({"prompt_tokens": -1}, "prompt_tokens"),
+        ({"observed_rows": -1}, "observed_rows"),
+        ({"generated_rows": -1}, "generated_rows"),
+        ({"eos_step": 0}, "eos_step"),
+        ({"eos_step": 5}, "eos_step"),
+        ({"max_gen_len": 0}, "max_gen_len"),
+        ({"observed_rows": 7}, "observed_rows"),
+        ({"hit_generation_limit": True}, "hit_generation_limit"),
+    ],
+)
+def test_generation_stats_reject_inconsistent_values(updates, message):
+    values = _valid_generation_stats_fields()
+    values.update(updates)
+
+    with pytest.raises(ValueError, match=message):
+        ChunkGenerationStats(**values)
+
+
+def test_generation_stats_hit_limit_requires_a_missing_eos_at_the_limit():
+    values = _valid_generation_stats_fields()
+    values.update(
+        prompt_tokens=2,
+        observed_rows=64,
+        generated_rows=62,
+        eos_step=None,
+        hit_generation_limit=True,
+    )
+
+    record = ChunkGenerationStats(**values)
+
+    assert record.hit_generation_limit is True
+
+
+def test_generation_stats_hit_limit_flag_must_be_bool():
+    values = _valid_generation_stats_fields()
+    values["hit_generation_limit"] = 0
+
+    with pytest.raises(TypeError, match="hit_generation_limit"):
+        ChunkGenerationStats(**values)
+
+
+def test_generation_stats_exclude_forced_prompt_echoes(monkeypatch):
+    class FakeTracker:
+        def __init__(self, *_args):
+            pass
+
+        def feed(self, _item):
+            pass
+
+        @staticmethod
+        def open_keys():
+            return [(0, 60)]
+
+    monkeypatch.setattr("muscriptor.transcription_model.OpenNoteTracker", FakeTracker)
+    tokenizer = SimpleNamespace(
+        eos_id=EOS,
+        _vocab=[],
+        frame_rate=100,
+        tie_section_token_ids=lambda _keys: [70, 71],
+    )
+    scripts = iter([[[10], [EOS]], [[20], [EOS]]])
+
+    def generate(prompt=None, **_kwargs):
+        if prompt is not None:
+            for token in prompt[0].tolist():
+                yield torch.tensor([token])
+        for row in next(scripts):
+            yield torch.tensor(row)
+
+    records = []
+    fake = SimpleNamespace(
+        _model=SimpleNamespace(generate=generate),
+        _tokenizer=tokenizer,
+        _device=torch.device("cpu"),
+    )
+    stream = TranscriptionModel._generate_token_stream(
+        fake,
+        [object(), object()],
+        [0.0, 5.0],
+        batch_size=1,
+        max_gen_len=64,
+        use_sampling=False,
+        temperature=1.0,
+        cfg_coef=1.0,
+        no_eos_is_ok=False,
+        prelude_forcing=True,
+        _generation_observer=records.append,
+    )
+
+    list(stream)
+
+    assert records == [
+        ChunkGenerationStats(
+            chunk_index=0,
+            seek_time_us=0,
+            prompt_tokens=0,
+            observed_rows=2,
+            generated_rows=2,
+            eos_step=2,
+            max_gen_len=64,
+            hit_generation_limit=False,
+        ),
+        ChunkGenerationStats(
+            chunk_index=1,
+            seek_time_us=5_000_000,
+            prompt_tokens=2,
+            observed_rows=4,
+            generated_rows=2,
+            eos_step=2,
+            max_gen_len=64,
+            hit_generation_limit=False,
+        ),
+    ]
+
+
 def test_closing_token_stream_closes_active_model_steps():
     class ClosableSteps:
         def __init__(self):
@@ -189,13 +394,15 @@ def test_closing_token_stream_closes_active_model_steps():
             self.closed = True
 
     steps = ClosableSteps()
-    stream = _stream_from_steps(steps)
+    records = []
+    stream = _stream_from_steps(steps, generation_observer=records.append)
 
     assert next(stream) == ChunkBoundary(0.0, None)
     assert next(stream) == 10
     stream.close()
 
     assert steps.closed is True
+    assert records == []
 
 
 def test_model_step_error_is_propagated_and_iterator_is_closed():
@@ -217,7 +424,8 @@ def test_model_step_error_is_propagated_and_iterator_is_closed():
             self.closed = True
 
     steps = FailingSteps()
-    stream = _stream_from_steps(steps)
+    records = []
+    stream = _stream_from_steps(steps, generation_observer=records.append)
 
     assert next(stream) == ChunkBoundary(0.0, None)
     assert next(stream) == 10
@@ -225,6 +433,7 @@ def test_model_step_error_is_propagated_and_iterator_is_closed():
         next(stream)
 
     assert steps.closed is True
+    assert records == []
 
 
 def test_token_stream_accepts_model_steps_without_close():
@@ -336,6 +545,51 @@ def test_missing_eos_raises_by_default():
     assert closed_calls == [True]
 
 
+def test_missing_eos_notifies_all_chunks_before_strict_error():
+    rows = [[10, 20], [11, 21]]
+    closed_calls = []
+    records = []
+
+    def observe(record):
+        assert closed_calls == [True]
+        records.append(record)
+
+    stream, _ = _run(
+        [rows],
+        batch_size=2,
+        seek_times=[0.0, 5.0],
+        max_gen_len=2,
+        generation_observer=observe,
+        closed_calls=closed_calls,
+    )
+
+    with pytest.raises(RuntimeError, match="did not emit EOS"):
+        list(stream)
+
+    assert records == [
+        ChunkGenerationStats(
+            chunk_index=0,
+            seek_time_us=0,
+            prompt_tokens=0,
+            observed_rows=2,
+            generated_rows=2,
+            eos_step=None,
+            max_gen_len=2,
+            hit_generation_limit=True,
+        ),
+        ChunkGenerationStats(
+            chunk_index=1,
+            seek_time_us=5_000_000,
+            prompt_tokens=0,
+            observed_rows=2,
+            generated_rows=2,
+            eos_step=None,
+            max_gen_len=2,
+            hit_generation_limit=True,
+        ),
+    ]
+
+
 def test_missing_eos_warns_and_still_emits_when_allowed():
     rows = [[10, 20], [11, 21]]
     stream, _ = _run([rows], batch_size=2, seek_times=[0.0, 5.0], no_eos_is_ok=True)
@@ -416,9 +670,17 @@ class _MinimalTranscriber(TranscriptionModel):
             device=torch.device("cpu"),
         )
         self.profile_seen = None
+        self.generation_observer_seen = None
 
-    def _generate_token_stream(self, *_args, profile=False, **_kwargs):
+    def _generate_token_stream(
+        self,
+        *_args,
+        profile=False,
+        _generation_observer=None,
+        **_kwargs,
+    ):
         self.profile_seen = profile
+        self.generation_observer_seen = _generation_observer
         return iter(())
 
 
@@ -470,6 +732,31 @@ def test_transcribe_can_suppress_progress_output_for_benchmarks(capsys):
     captured = capsys.readouterr()
     assert len(events) == 1
     assert (captured.out, captured.err) == ("", "")
+
+
+def test_default_path_keeps_legacy_private_override_call_shape():
+    class LegacyOverride(_MinimalTranscriber):
+        def __init__(self):
+            super().__init__()
+            self.generate_calls = 0
+
+        def _generate_token_stream(self, *_args, profile=False):
+            self.generate_calls += 1
+            self.profile_seen = profile
+            return iter(())
+
+    model = LegacyOverride()
+
+    events = list(
+        model.transcribe(
+            (torch.zeros(1, 100), 16_000),
+            profile=True,
+            log_progress=False,
+        )
+    )
+
+    assert events == [ProgressEvent(completed=0, total=1)]
+    assert (model.generate_calls, model.profile_seen) == (1, True)
 
 
 def test_transcribe_remains_lazy_when_using_a_prepared_audio_path():
@@ -596,6 +883,42 @@ def test_transcribe_forwards_profile_to_token_generation(monkeypatch):
     list(model.transcribe((torch.zeros(1, 100), 16_000), profile=True))
 
     assert model.profile_seen is True
+
+
+def test_private_prepared_path_forwards_generation_observer():
+    model = _MinimalTranscriber()
+
+    def observer(_record):
+        pass
+
+    list(
+        model._transcribe_prepared(
+            torch.zeros(1, 100),
+            log_progress=False,
+            _generation_observer=observer,
+        )
+    )
+
+    assert model.generation_observer_seen is observer
+
+
+def test_generation_observer_is_private_and_keyword_only():
+    assert (
+        "_generation_observer"
+        not in inspect.signature(TranscriptionModel.transcribe).parameters
+    )
+    assert (
+        inspect.signature(TranscriptionModel._transcribe_prepared)
+        .parameters["_generation_observer"]
+        .kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert (
+        inspect.signature(TranscriptionModel._generate_token_stream)
+        .parameters["_generation_observer"]
+        .kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
 
 
 def test_transcribe_profile_writes_timings_only_to_stderr(monkeypatch, capsys):

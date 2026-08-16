@@ -89,6 +89,68 @@ class _ModelConfig:
     card: int
 
 
+@dataclass(frozen=True, slots=True)
+class ChunkGenerationStats:
+    """完了した1 chunkのselected-output生成統計。
+
+    ``observed_rows`` はmodelのstep iteratorから実際に取得したrow数で、
+    prompt echoを含む。``generated_rows`` はそこから``prompt_tokens``を
+    除いたrow数、``eos_step`` は生成row内で最初にEOSを観測した1-originの
+    位置である。batch生成では、先にEOSへ到達したchunkについても、同じ
+    batchの完了まで取得したrowを両row数へ含めるため、EOS後に生じた実際の
+    batch計算量を把握できる。
+
+    beam searchでは内部beamの探索過程ではなく、modelが最後にreplayする
+    selected outputだけを観測する。
+    """
+
+    chunk_index: int
+    seek_time_us: int
+    prompt_tokens: int
+    observed_rows: int
+    generated_rows: int
+    eos_step: int | None
+    max_gen_len: int
+    hit_generation_limit: bool
+
+    def __post_init__(self) -> None:
+        nonnegative_integer_fields = (
+            "chunk_index",
+            "seek_time_us",
+            "prompt_tokens",
+            "observed_rows",
+            "generated_rows",
+        )
+        for name in nonnegative_integer_fields:
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an int (bool is not accepted)")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+        if type(self.max_gen_len) is not int:
+            raise TypeError("max_gen_len must be an int (bool is not accepted)")
+        if self.max_gen_len < 1:
+            raise ValueError("max_gen_len must be positive")
+
+        if self.eos_step is not None:
+            if type(self.eos_step) is not int:
+                raise TypeError(
+                    "eos_step must be an int or None (bool is not accepted)"
+                )
+            if not 1 <= self.eos_step <= self.generated_rows:
+                raise ValueError("eos_step must be within generated_rows")
+
+        if type(self.hit_generation_limit) is not bool:
+            raise TypeError("hit_generation_limit must be a bool")
+        if self.observed_rows != self.prompt_tokens + self.generated_rows:
+            raise ValueError("observed_rows must equal prompt_tokens + generated_rows")
+
+        expected_hit = self.eos_step is None and self.observed_rows >= self.max_gen_len
+        if self.hit_generation_limit is not expected_hit:
+            raise ValueError("hit_generation_limit is inconsistent with EOS and rows")
+
+
 # Per-variant configs, keyed by the size that appears in the HF repo name
 # (muscriptor-<size>). Each published repo also ships these values in its
 # config.json; this table is the fallback when no config.json is present.
@@ -394,6 +456,8 @@ class TranscriptionModel:
         prelude_forcing: bool = True,
         profile: bool = False,
         log_progress: bool = True,
+        *,
+        _generation_observer: Callable[[ChunkGenerationStats], None] | None = None,
     ) -> Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent]:
         """canonicalize済みの音声から採譜eventを生成する。"""
         batch_size = self._resolve_batch_size(batch_size, prelude_forcing)
@@ -440,8 +504,8 @@ class TranscriptionModel:
         # timing baseline (t0) for the first chunk, before any tokens are gen'd.
         yield ProgressEvent(completed=0, total=num_chunks)
 
-        yield from decode_model_tokens(
-            self._generate_token_stream(
+        if _generation_observer is None:
+            token_stream = self._generate_token_stream(
                 all_conditions,
                 seek_times,
                 batch_size,
@@ -454,7 +518,26 @@ class TranscriptionModel:
                 beam_size,
                 forbidden_tokens,
                 profile=profile,
-            ),
+            )
+        else:
+            token_stream = self._generate_token_stream(
+                all_conditions,
+                seek_times,
+                batch_size,
+                max_gen_len,
+                use_sampling,
+                temperature,
+                cfg_coef,
+                no_eos_is_ok,
+                prelude_forcing,
+                beam_size,
+                forbidden_tokens,
+                profile=profile,
+                _generation_observer=_generation_observer,
+            )
+
+        yield from decode_model_tokens(
+            token_stream,
             self._tokenizer._vocab,
             self._instrument_for_program,
             frame_rate=self._tokenizer.frame_rate,
@@ -495,6 +578,8 @@ class TranscriptionModel:
         beam_size: int = 1,
         forbidden_tokens: torch.Tensor | None = None,
         profile: bool = False,
+        *,
+        _generation_observer: Callable[[ChunkGenerationStats], None] | None = None,
     ) -> Iterator[int | ChunkBoundary | ProgressEvent]:
         """Generate tokens and yield them per chunk, as soon as they are ready.
 
@@ -558,6 +643,11 @@ class TranscriptionModel:
                     )
             yield bnd
 
+            if _generation_observer is not None:
+                prompt_tokens = 0 if prompt is None else prompt.shape[-1]
+                observed_rows = 0
+                eos_steps: list[int | None] = [None] * n
+
             steps = self._model.generate(
                 prompt=prompt,
                 conditions=batch_conditions,
@@ -575,12 +665,17 @@ class TranscriptionModel:
             try:
                 for step in steps:
                     row = step.tolist()  # one token per chunk: [n]
+                    if _generation_observer is not None:
+                        observed_rows += 1
+                        generated_step = observed_rows - prompt_tokens
                     for j in range(n):
                         if done[j]:
                             continue
                         tok = row[j]
                         if tok == eos_id:
                             done[j] = True
+                            if _generation_observer is not None and generated_step > 0:
+                                eos_steps[j] = generated_step
                         else:
                             if tracker is not None:
                                 tracker.feed(tok)
@@ -602,6 +697,25 @@ class TranscriptionModel:
                 close = getattr(steps, "close", None)
                 if callable(close):
                     close()
+
+            if _generation_observer is not None:
+                generated_rows = max(0, observed_rows - prompt_tokens)
+                for j in range(n):
+                    eos_step = eos_steps[j]
+                    _generation_observer(
+                        ChunkGenerationStats(
+                            chunk_index=batch_start + j,
+                            seek_time_us=round(seek_times[batch_start + j] * 1_000_000),
+                            prompt_tokens=prompt_tokens,
+                            observed_rows=observed_rows,
+                            generated_rows=generated_rows,
+                            eos_step=eos_step,
+                            max_gen_len=max_gen_len,
+                            hit_generation_limit=(
+                                eos_step is None and observed_rows >= max_gen_len
+                            ),
+                        )
+                    )
 
             # Any chunk still open never emitted EOS within max_gen_len.
             for j in range(active, n):
