@@ -205,6 +205,154 @@ def test_run_benchmark_synchronizes_outside_each_timed_lazy_stream():
     ]
 
 
+def test_run_benchmark_releases_warmup_events_before_the_final_warmup_sync():
+    actions: list[str] = []
+    stream_calls = 0
+    sync_count = 0
+
+    class ObservedProgressEvent(ProgressEvent):
+        def __del__(self):
+            actions.append("release")
+
+    def stream():
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 1:
+            yield ObservedProgressEvent(completed=0, total=0)
+
+    def synchronize():
+        nonlocal sync_count
+        sync_count += 1
+        actions.append(f"sync-{sync_count}")
+
+    run_benchmark(
+        stream,
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=1, measured_runs=1),
+        synchronize=synchronize,
+        clock_ns=iter((0, 1)).__next__,
+    )
+
+    assert actions.index("release") < actions.index("sync-2")
+
+
+def test_run_benchmark_releases_previous_events_before_the_next_start_sync():
+    clock = _ManualClock()
+    actions: list[str] = []
+    sync_count = 0
+
+    class TimedProgressEvent(ProgressEvent):
+        def __del__(self):
+            actions.append("release")
+            clock.advance(100)
+
+    def stream():
+        clock.advance(10)
+        yield TimedProgressEvent(completed=0, total=0)
+
+    def synchronize():
+        nonlocal sync_count
+        sync_count += 1
+        actions.append(f"sync-{sync_count}")
+
+    report = run_benchmark(
+        stream,
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=2),
+        synchronize=synchronize,
+        clock_ns=clock,
+    )
+
+    assert (
+        tuple(sample.wall_time_ns for sample in report.samples),
+        actions.index("release") < actions.index("sync-3"),
+        report.stream_digest,
+        report.note_digest,
+    ) == (
+        (10, 10),
+        True,
+        canonical_stream_digest([ProgressEvent(completed=0, total=0)]),
+        canonical_note_digest([ProgressEvent(completed=0, total=0)]),
+    )
+
+
+def test_run_benchmark_releases_previous_event_before_an_empty_run():
+    clock = _ManualClock()
+    actions: list[str] = []
+    stream_calls = 0
+    sync_count = 0
+
+    class TimedProgressEvent(ProgressEvent):
+        def __del__(self):
+            actions.append("release")
+            clock.advance(100)
+
+    def stream():
+        nonlocal stream_calls
+        stream_calls += 1
+        clock.advance(10)
+        if stream_calls == 1:
+            yield TimedProgressEvent(completed=0, total=0)
+
+    def synchronize():
+        nonlocal sync_count
+        sync_count += 1
+        actions.append(f"sync-{sync_count}")
+
+    report = run_benchmark(
+        stream,
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=2),
+        synchronize=synchronize,
+        clock_ns=clock,
+    )
+
+    assert (
+        tuple(sample.wall_time_ns for sample in report.samples),
+        actions.index("release") < actions.index("sync-3"),
+    ) == ((10, 10), True)
+
+
+def test_run_benchmark_releases_previous_event_before_a_later_run_fails():
+    clock = _ManualClock()
+    actions: list[str] = []
+    stream_calls = 0
+    sync_count = 0
+
+    class ObservedProgressEvent(ProgressEvent):
+        def __del__(self):
+            actions.append("release")
+
+    def stream():
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 1:
+            clock.advance(10)
+            yield ObservedProgressEvent(completed=0, total=0)
+            return
+        raise RuntimeError("fake stream failure")
+
+    def synchronize():
+        nonlocal sync_count
+        sync_count += 1
+        actions.append(f"sync-{sync_count}")
+
+    with pytest.raises(RuntimeError, match="fake stream failure"):
+        run_benchmark(
+            stream,
+            workload=BenchmarkWorkload("fake"),
+            environment=BenchmarkEnvironment("cpu-test"),
+            protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=2),
+            synchronize=synchronize,
+            clock_ns=clock,
+        )
+
+    assert actions.index("release") < actions.index("sync-3")
+
+
 def test_run_benchmark_records_elapsed_time_progress_and_event_counts():
     clock = _ManualClock()
     events = _note_stream()

@@ -353,19 +353,24 @@ def run_benchmark(
         synchronize()
         for _event in event_stream_factory():
             pass
+        # 最後のwarmup eventも解放してから同期し、解放に伴う処理を完了させる。
+        _event = None
         synchronize()
 
     samples: list[BenchmarkSample] = []
     for index in range(protocol.measured_runs):
-        synchronize()
-        started_ns = clock_ns()
+        # 前runのevent参照は開始同期より前に破棄し、解放処理を次の計測へ
+        # 混入させない。空streamでもloop変数の参照が残らないようにする。
         events: list[TranscriptionEvent] = []
         milestones: list[ProgressMilestone] = []
+        event: TranscriptionEvent | None = None
         first_progress_ns: int | None = None
         first_note_ns: int | None = None
         note_start_count = 0
         note_end_count = 0
         progress_count = 0
+        synchronize()
+        started_ns = clock_ns()
 
         for event in event_stream_factory():
             events.append(event)
