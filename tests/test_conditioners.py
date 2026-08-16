@@ -1,7 +1,10 @@
 """Tests for muscriptor/modules/conditioners.py — CPU only."""
 
+import inspect
+
 import torch
 
+import muscriptor.accelerator
 from muscriptor.modules.conditioners import (
     ConditioningAttributes,
     WavCondition,
@@ -90,6 +93,59 @@ def test_mel_conditioner_output_shape():
     assert mask.shape[0] == 1
 
 
+def test_mel_conditioner_is_silent_and_does_not_synchronize_by_default(
+    monkeypatch, capsys
+):
+    synchronize_calls = []
+    monkeypatch.setattr(
+        muscriptor.accelerator,
+        "synchronize",
+        lambda device=None: synchronize_calls.append(device),
+    )
+    cond = _make_mel_conditioner(output_dim=32)
+    wav = WavCondition(
+        wav=torch.randn(1, 1, 1600),
+        length=torch.tensor([1600]),
+        sample_rate=[16000],
+    )
+
+    cond(cond.tokenize(wav))
+    captured = capsys.readouterr()
+
+    assert (synchronize_calls, captured.out, captured.err) == ([], "", "")
+
+
+def test_mel_conditioner_accepts_explicit_profiling():
+    parameter = inspect.signature(MelSpectrogramConditioner.forward).parameters.get(
+        "profile"
+    )
+
+    assert parameter is not None
+    assert parameter.default is False
+
+
+def test_mel_conditioner_profile_times_mel_on_its_device(monkeypatch, capsys):
+    synchronize_calls = []
+    monkeypatch.setattr(
+        muscriptor.accelerator,
+        "synchronize",
+        lambda device=None: synchronize_calls.append(device),
+    )
+    cond = _make_mel_conditioner(output_dim=32)
+    wav = WavCondition(
+        wav=torch.randn(1, 1, 1600),
+        length=torch.tensor([1600]),
+        sample_rate=[16000],
+    )
+
+    cond(cond.tokenize(wav), profile=True)
+    captured = capsys.readouterr()
+
+    assert synchronize_calls == [torch.device("cpu"), torch.device("cpu")]
+    assert captured.out == ""
+    assert "[muscriptor] mel-spec (1 × 1600 samples):" in captured.err
+
+
 def test_mel_conditioner_mask_dtype():
     cond = _make_mel_conditioner()
     wav = WavCondition(
@@ -147,6 +203,15 @@ def test_conditioning_provider_tokenize_and_forward():
     assert "audio" in conditions
     embed, mask = conditions["audio"]
     assert embed.shape[-1] == 16
+
+
+def test_conditioning_provider_accepts_explicit_profiling():
+    parameter = inspect.signature(ConditioningProvider.forward).parameters.get(
+        "profile"
+    )
+
+    assert parameter is not None
+    assert parameter.default is False
 
 
 # ---------------------------------------------------------------------------

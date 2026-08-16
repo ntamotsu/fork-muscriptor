@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import sys
 import urllib.request
 from pathlib import Path
 from huggingface_hub import hf_hub_download
@@ -74,7 +75,7 @@ def download_if_necessary(url: str | Path) -> Path:
         dest = _CACHE_DIR / f"{url_hash}_{filename}"
         if dest.exists():
             return dest
-        print(f"Downloading {filename} …")
+        print(f"Downloading {filename} …", file=sys.stderr)
         # Download to a per-process temp file, then rename: an interrupted or
         # concurrent download must never leave a partial file at `dest`, where
         # it would be mistaken for a complete one forever after.

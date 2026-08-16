@@ -8,7 +8,6 @@ Contains only the classes needed to run the transcription model:
 - nullify_all_conditions (for CFG at inference)
 """
 
-import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -18,8 +17,8 @@ from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
 
-import muscriptor.accelerator
 from muscriptor.modules.mel_spectrogram import _MelSpectrogram
+from muscriptor.profiling import timed as profile_timed
 from muscriptor.utils.sampling import length_to_mask
 
 
@@ -158,34 +157,31 @@ class MelSpectrogramConditioner(nn.Module):
             wav.to(self.device), length.to(self.device), sample_rate, path, seek_time
         )
 
-    def _mel_embedding(self, x: WavCondition) -> torch.Tensor:
+    def _mel_embedding(self, x: WavCondition, *, profile: bool = False) -> torch.Tensor:
         if x.wav.shape[-1] == 1:
             return torch.zeros(x.wav.shape[0], 1, self.dim, device=self.device)
-        muscriptor.accelerator.synchronize()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            wav = x.wav
-            if self.normalize_audio:
-                wav = wav / (wav.abs().max(dim=-1, keepdim=True).values + 1e-8)
-            mel = self.mel_spec_transform(wav)
-            mel = rearrange(mel, "b 1 d t -> b t d")
-            if self.fine_frame_rate_ratio > 1:
-                mel = rearrange(
-                    mel[:, :-1], "b (t f) d -> b t (f d)", f=self.fine_frame_rate_ratio
-                )
-            if self.log_scale:
-                mel = torch.log(mel + self.eps)
-        muscriptor.accelerator.synchronize()
-        print(
-            f"[muscriptor] mel-spec ({wav.shape[0]} × {wav.shape[-1]} samples): "
-            f"{time.perf_counter() - t0:.3f}s"
-        )
+        label = f"mel-spec ({x.wav.shape[0]} × {x.wav.shape[-1]} samples)"
+        with profile_timed(profile, label, device=x.wav.device, precision=3):
+            with torch.no_grad():
+                wav = x.wav
+                if self.normalize_audio:
+                    wav = wav / (wav.abs().max(dim=-1, keepdim=True).values + 1e-8)
+                mel = self.mel_spec_transform(wav)
+                mel = rearrange(mel, "b 1 d t -> b t d")
+                if self.fine_frame_rate_ratio > 1:
+                    mel = rearrange(
+                        mel[:, :-1],
+                        "b (t f) d -> b t (f d)",
+                        f=self.fine_frame_rate_ratio,
+                    )
+                if self.log_scale:
+                    mel = torch.log(mel + self.eps)
         return mel
 
-    def forward(self, x: WavCondition) -> ConditionType:
+    def forward(self, x: WavCondition, profile: bool = False) -> ConditionType:
         _, lengths, *_ = x
         with torch.no_grad():
-            embeds = self._mel_embedding(x)
+            embeds = self._mel_embedding(x, profile=profile)
         embeds = embeds.to(self.output_proj.weight)
         embeds = self.output_proj(embeds)
 
@@ -220,7 +216,7 @@ class ClassConditioner(nn.Module):
         int_x = 1 + torch.LongTensor(int_x).to(self.device)
         return int_x
 
-    def forward(self, inputs: torch.Tensor) -> ConditionType:
+    def forward(self, inputs: torch.Tensor, profile: bool = False) -> ConditionType:
         embeds = self.embed(inputs + 1)
         mask = torch.ones_like(embeds[..., 0])
         return embeds, mask
@@ -312,9 +308,11 @@ class ConditioningProvider(nn.Module):
 
         return output
 
-    def forward(self, tokenized: dict[str, Any]) -> dict[str, ConditionType]:
+    def forward(
+        self, tokenized: dict[str, Any], profile: bool = False
+    ) -> dict[str, ConditionType]:
         output = {}
         for attribute, inputs in tokenized.items():
-            condition, mask = self.conditioners[attribute](inputs)
+            condition, mask = self.conditioners[attribute](inputs, profile=profile)
             output[attribute] = (condition, mask)
         return output

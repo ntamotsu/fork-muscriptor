@@ -4,6 +4,7 @@ Uses a fake transcriber so no weights / audio decoding is required.
 """
 
 import base64
+import inspect
 import io
 import json
 import threading
@@ -94,6 +95,13 @@ def test_event_to_dict_start_and_end():
     }
 
 
+def test_create_app_accepts_an_opt_in_profile_setting():
+    parameter = inspect.signature(create_app).parameters.get("profile")
+
+    assert parameter is not None
+    assert parameter.default is False
+
+
 def test_transcribe_streams_sse_events(tmp_path):
     s0 = NoteStartEvent(pitch=60, start_time=0.0, index=0, instrument="piano")
     s1 = NoteStartEvent(pitch=64, start_time=0.1, index=1, instrument="guitar")
@@ -123,6 +131,19 @@ def test_transcribe_streams_sse_events(tmp_path):
         "beat_grid": None,
     }
     assert model.transcribe.call_count == 1
+
+
+def test_transcribe_stream_forwards_server_profile_setting(tmp_path):
+    model = make_model()
+    client = TestClient(create_app(model, profile=True))
+
+    response = client.post(
+        "/transcribe",
+        files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert model.transcribe.call_args.kwargs.get("profile") is True
 
 
 def test_transcribe_sends_beat_grid(tmp_path):
@@ -284,6 +305,19 @@ def test_transcribe_midi_returns_bytes_with_headers(tmp_path):
     assert resp.headers["content-type"] == "audio/midi"
     assert resp.headers["content-disposition"] == 'attachment; filename="result.mid"'
     assert resp.content == FAKE_MIDI
+
+
+def test_transcribe_midi_forwards_server_profile_setting(tmp_path):
+    model = make_model()
+    client = TestClient(create_app(model, profile=True))
+
+    response = client.post(
+        "/transcribe/midi",
+        files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert model.transcribe_to_midi.call_args.kwargs.get("profile") is True
 
 
 def test_transcribe_midi_passes_tensor_and_instruments(tmp_path):

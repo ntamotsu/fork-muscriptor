@@ -47,11 +47,24 @@ def current_accelerator() -> torch.device:
     raise RuntimeError("No available accelerator detected.")
 
 
-def synchronize() -> None:
-    """Wait for all kernels on the current accelerator to complete.
+def synchronize(device: torch.device | str | None = None) -> None:
+    """指定deviceのkernel完了を待つ。CPUは何もせず、未指定時は従来どおり現在のacceleratorを使う。"""
+    if device is not None:
+        device = torch.device(device)
+        if device.type == "cpu":
+            return
+        if _HAS_TORCH_ACCELERATOR:
+            try:
+                torch.accelerator.synchronize(device)
+            except (RuntimeError, ValueError):
+                pass
+            return
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        elif device.type == "mps" and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+        return
 
-    No-op if no accelerator is available.
-    """
     if _HAS_TORCH_ACCELERATOR:
         # torch.accelerator.synchronize() still tries to init CUDA even on CPU-only systems
         # Only call it if we actually have a non-CPU accelerator

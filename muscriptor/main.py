@@ -190,6 +190,13 @@ def transcribe(
             ),
         ),
     ] = True,
+    profile: Annotated[
+        bool,
+        typer.Option(
+            "--profile",
+            help="Measure inference phases with accelerator synchronization and write timings to stderr.",
+        ),
+    ] = False,
     auralize: Annotated[
         Path | None,
         typer.Option(
@@ -319,6 +326,7 @@ def transcribe(
         no_eos_is_ok=not strict_eos,
         beam_size=beam_size,
         prelude_forcing=prelude_forcing,
+        profile=profile,
     )
 
     if format == OutputFormat.sheets:
@@ -424,6 +432,13 @@ def serve(
             ),
         ),
     ] = None,
+    profile: Annotated[
+        bool,
+        typer.Option(
+            "--profile",
+            help="Measure inference phases with accelerator synchronization and write timings to stderr.",
+        ),
+    ] = False,
 ):
     """Run the HTTP transcription server (POST /transcribe → SSE event stream)."""
     import logging
@@ -440,7 +455,11 @@ def serve(
     typer.echo("Loading model…")
     model = _load_model(model_path, _device, dtype)
     web_dir = Path(__file__).resolve().parent / "web_dist"
-    fastapi_app = create_app(model, web_dir=web_dir if web_dir.is_dir() else None)
+    fastapi_app = create_app(
+        model,
+        web_dir=web_dir if web_dir.is_dir() else None,
+        profile=profile,
+    )
     uvicorn.run(fastapi_app, host=host, port=port)
 
 

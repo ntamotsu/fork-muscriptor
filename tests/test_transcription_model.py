@@ -183,6 +183,78 @@ class _FakeAudio:
     detect_beat_grid_for = TranscriptionModel.detect_beat_grid_for
 
 
+class _MinimalTranscriber:
+    transcribe = TranscriptionModel.transcribe
+    _device = torch.device("cpu")
+    _tokenizer = SimpleNamespace(_vocab=[], frame_rate=100)
+    _instrument_for_program = staticmethod(lambda _program: "piano")
+
+    @staticmethod
+    def _resolve_batch_size(_batch_size, _prelude_forcing):
+        return 1
+
+    @staticmethod
+    def _load_wav(tensor, _sample_rate):
+        return tensor
+
+    @staticmethod
+    def _build_conditions(_chunk, _instrument_group):
+        return [object()]
+
+    def __init__(self):
+        self.profile_seen = None
+
+    def _generate_token_stream(self, *_args, profile=False, **_kwargs):
+        self.profile_seen = profile
+        return iter(())
+
+
+def test_transcribe_keeps_progress_on_stderr_without_profiling_sync(
+    monkeypatch, capsys
+):
+    synchronize_calls = []
+    monkeypatch.setattr(
+        "muscriptor.transcription_model.muscriptor.accelerator.synchronize",
+        lambda device=None: synchronize_calls.append(device),
+    )
+    events = list(_MinimalTranscriber().transcribe((torch.zeros(1, 100), 16_000)))
+    captured = capsys.readouterr()
+
+    assert (len(events), synchronize_calls, captured.out) == (1, [], "")
+    assert "[muscriptor] audio:" in captured.err
+
+
+def test_transcribe_forwards_profile_to_token_generation(monkeypatch):
+    monkeypatch.setattr(
+        "muscriptor.transcription_model.muscriptor.accelerator.synchronize",
+        lambda _device=None: None,
+    )
+    model = _MinimalTranscriber()
+
+    list(model.transcribe((torch.zeros(1, 100), 16_000), profile=True))
+
+    assert model.profile_seen is True
+
+
+def test_transcribe_profile_writes_timings_only_to_stderr(monkeypatch, capsys):
+    synchronize_calls = []
+    monkeypatch.setattr(
+        "muscriptor.transcription_model.muscriptor.accelerator.synchronize",
+        lambda device=None: synchronize_calls.append(device),
+    )
+
+    list(_MinimalTranscriber().transcribe((torch.zeros(1, 100), 16_000), profile=True))
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert synchronize_calls
+    assert set(synchronize_calls) == {torch.device("cpu")}
+    assert "[muscriptor] load audio:" in captured.err
+    assert "[muscriptor] build conditions:" in captured.err
+    assert "[muscriptor] generate total:" not in captured.err
+    assert "[muscriptor] transcribe total:" not in captured.err
+
+
 def test_detect_tempo_modes(monkeypatch):
     def boom(*args, **kwargs):
         raise BeatDetectionError("no fixed tempo")

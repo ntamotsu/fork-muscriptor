@@ -1,12 +1,10 @@
 """TranscriptionModel: main user-facing entry point."""
 
-import contextlib
 import io
 import json
 import math
 import re
 import sys
-import time
 import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -33,6 +31,7 @@ from muscriptor.modules.conditioners import (
     MelSpectrogramConditioner,
     WavCondition,
 )
+from muscriptor.profiling import timed as profile_timed
 from muscriptor.tokenizer.mt3 import (
     MT3_FULL_PLUS_GROUP_NAMES,
     MT3Tokenizer,
@@ -53,20 +52,6 @@ from muscriptor.utils.beats import (
 )
 from muscriptor.utils.download import download_companion, download_if_necessary
 from muscriptor.utils.midi import notes_to_midi
-
-
-@contextlib.contextmanager
-def _timed(label: str, store: list[tuple[str, float]] | None = None):
-    """Print and (optionally) record how long a block of work takes."""
-    muscriptor.accelerator.synchronize()
-    t0 = time.perf_counter()
-    yield
-    muscriptor.accelerator.synchronize()
-    dt = time.perf_counter() - t0
-    print(f"[muscriptor] {label}: {dt:.2f}s", file=sys.stderr)
-    if store is not None:
-        store.append((label, dt))
-
 
 # Published model variants live at hf://MuScriptor/muscriptor-<size>. A bare
 # size keyword ("small"/"medium"/"large") resolves to the matching repo; the
@@ -343,6 +328,7 @@ class TranscriptionModel:
         no_eos_is_ok: bool = True,
         beam_size: int = 1,
         prelude_forcing: bool = True,
+        profile: bool = False,
     ) -> Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent]:
         """Transcribe audio into a stream of note events.
 
@@ -391,15 +377,12 @@ class TranscriptionModel:
                 dtype=torch.long,
             )
 
-        timings: list[tuple[str, float]] = []
-        t_total = time.perf_counter()
-
         if isinstance(audio, tuple):
             tensor, sample_rate = audio
-            with _timed("load audio", timings):
+            with profile_timed(profile, "load audio", device=self._device):
                 wav = self._load_wav(tensor, sample_rate)
         else:
-            with _timed("load audio", timings):
+            with profile_timed(profile, "load audio", device=self._device):
                 wav = self._load_wav(audio, None)
 
         total_samples = wav.shape[-1]
@@ -413,7 +396,7 @@ class TranscriptionModel:
             file=sys.stderr,
         )
 
-        with _timed("build conditions", timings):
+        with profile_timed(profile, "build conditions", device=self._device):
             all_conditions: list[ConditioningAttributes] = []
             seek_times: list[float] = []
             for i in range(num_chunks):
@@ -425,8 +408,6 @@ class TranscriptionModel:
                     self._build_conditions(chunk, instrument_group)[0]
                 )
                 seek_times.append(i * _SEGMENT_DURATION)
-
-        t_gen = time.perf_counter()
 
         # Up-front anchor: tells consumers the total chunk count and gives them a
         # timing baseline (t0) for the first chunk, before any tokens are gen'd.
@@ -445,21 +426,11 @@ class TranscriptionModel:
                 prelude_forcing,
                 beam_size,
                 forbidden_tokens,
+                profile=profile,
             ),
             self._tokenizer._vocab,
             self._instrument_for_program,
             frame_rate=self._tokenizer.frame_rate,
-        )
-
-        muscriptor.accelerator.synchronize()
-        print(
-            f"[muscriptor] generate total: {time.perf_counter() - t_gen:.2f}s",
-            file=sys.stderr,
-        )
-        print(
-            f"[muscriptor] transcribe total: {time.perf_counter() - t_total:.2f}s "
-            f"({total_duration:.1f}s audio)",
-            file=sys.stderr,
         )
 
     def _resolve_batch_size(self, batch_size: int | None, prelude_forcing: bool) -> int:
@@ -496,6 +467,7 @@ class TranscriptionModel:
         prelude_forcing: bool = True,
         beam_size: int = 1,
         forbidden_tokens: torch.Tensor | None = None,
+        profile: bool = False,
     ) -> Iterator[int | ChunkBoundary | ProgressEvent]:
         """Generate tokens and yield them per chunk, as soon as they are ready.
 
@@ -569,6 +541,7 @@ class TranscriptionModel:
                 early_stop_on_token=eos_id,
                 beam_size=beam_size,
                 forbidden_tokens=forbidden_tokens,
+                profile=profile,
             ):
                 row = step.tolist()  # one token per chunk: [n]
                 for j in range(n):
@@ -630,6 +603,7 @@ class TranscriptionModel:
         beam_size: int = 1,
         prelude_forcing: bool = True,
         detect_tempo: TempoDetection = "best-effort",
+        profile: bool = False,
     ) -> bytes:
         """Same as :meth:`transcribe` but returns a MIDI file as bytes."""
         beat_grid = self.detect_beat_grid_for(audio, detect_tempo)
@@ -643,6 +617,7 @@ class TranscriptionModel:
             no_eos_is_ok=no_eos_is_ok,
             beam_size=beam_size,
             prelude_forcing=prelude_forcing,
+            profile=profile,
         )
         return self.events_to_midi_bytes(events, beat_grid=beat_grid)
 

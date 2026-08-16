@@ -172,7 +172,7 @@ def _forbidden_tokens_used_by_transcribe(instruments, tokenizer):
         def _build_conditions(self, wav, instrument_group=None):
             return [SimpleNamespace()]
 
-        def _generate_token_stream(self, *args):
+        def _generate_token_stream(self, *args, **_kwargs):
             captured["forbidden_tokens"] = args[-1]
             return iter([])
 

@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 import muscriptor.main as main_mod
+import muscriptor.server as server_mod
 from muscriptor.events import NoteEndEvent, NoteStartEvent
 
 
@@ -44,6 +45,22 @@ class _FakeModel:
 
     def transcribe_to_midi(self, **kwargs):
         type(self).last_kwargs = kwargs
+        return b"FAKE_MIDI"
+
+
+class _RealMidiMethodModel(_FakeModel):
+    transcribe_to_midi = main_mod.TranscriptionModel.transcribe_to_midi
+
+    def transcribe(self, audio, **kwargs):
+        return super().transcribe(audio=audio, **kwargs)
+
+    @staticmethod
+    def detect_beat_grid_for(_audio, _detect_tempo):
+        return None
+
+    @staticmethod
+    def events_to_midi_bytes(_events, *, beat_grid):
+        assert beat_grid is None
         return b"FAKE_MIDI"
 
 
@@ -115,6 +132,57 @@ def test_progress_messages_go_to_stderr(patched_model, fake_audio):
     assert "Transcribing" in result.stderr
     assert "Loading model" not in result.stdout
     assert "Transcribing" not in result.stdout
+
+
+def test_profile_flag_is_forwarded_to_transcription(patched_model, fake_audio):
+    runner = CliRunner()
+    result = runner.invoke(
+        main_mod.app,
+        ["transcribe", str(fake_audio), "--profile", "-f", "jsonl", "-o", "-"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _FakeModel.last_kwargs["profile"] is True
+
+
+def test_profile_flag_works_with_the_real_midi_method(
+    monkeypatch, fake_audio, tmp_path
+):
+    monkeypatch.setattr(main_mod, "TranscriptionModel", _RealMidiMethodModel)
+    output = tmp_path / "result.mid"
+    result = CliRunner().invoke(
+        main_mod.app,
+        [
+            "transcribe",
+            str(fake_audio),
+            "--profile",
+            "-f",
+            "midi",
+            "-o",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert output.read_bytes() == b"FAKE_MIDI"
+
+
+def test_serve_profile_flag_is_forwarded_to_the_app(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main_mod, "_load_model", lambda *_args: object())
+    monkeypatch.setattr("logging.basicConfig", lambda **_kwargs: None)
+
+    def fake_create_app(model, **kwargs):
+        seen.update(model=model, **kwargs)
+        return object()
+
+    monkeypatch.setattr(server_mod, "create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", lambda *_args, **_kwargs: None)
+
+    result = CliRunner().invoke(main_mod.app, ["serve", "--profile"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["profile"] is True
 
 
 def test_jsonl_to_file_keeps_progress_on_stderr(patched_model, fake_audio, tmp_path):

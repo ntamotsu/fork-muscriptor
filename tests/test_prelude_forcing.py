@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import muscriptor.accelerator
 from muscriptor.events import (
     ChunkBoundary,
     NoteEndEvent,
@@ -29,7 +30,7 @@ from muscriptor.events import (
     decode_model_tokens,
 )
 from muscriptor.models.lm import LMModel
-from muscriptor.modules.conditioners import ConditioningProvider
+from muscriptor.modules.conditioners import ConditioningAttributes, ConditioningProvider
 from muscriptor.tokenizer.mt3 import MT3Tokenizer
 from muscriptor.tokenizer.notes import NoteEvent, TieNoteEvent, build_event_vocab
 from muscriptor.transcription_model import TranscriptionModel
@@ -392,6 +393,75 @@ def test_generate_yields_prompt_tokens_first(tiny_model):
     )
     assert tokens[:3] == [5, 3, 9]
     assert len(tokens) == 8
+
+
+def test_generate_is_silent_and_does_not_synchronize_by_default(
+    tiny_model, monkeypatch, capsys
+):
+    synchronize_calls = []
+    monkeypatch.setattr(
+        muscriptor.accelerator,
+        "synchronize",
+        lambda device=None: synchronize_calls.append(device),
+    )
+
+    list(
+        tiny_model.generate(
+            conditions=[ConditioningAttributes()],
+            max_gen_len=2,
+            use_sampling=False,
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert (synchronize_calls, captured.out, captured.err) == ([], "", "")
+
+
+def test_generate_profile_writes_condition_timing_only_to_stderr(
+    tiny_model, monkeypatch, capsys
+):
+    synchronize_calls = []
+    monkeypatch.setattr(
+        muscriptor.accelerator,
+        "synchronize",
+        lambda device=None: synchronize_calls.append(device),
+    )
+
+    list(
+        tiny_model.generate(
+            conditions=[ConditioningAttributes()],
+            max_gen_len=2,
+            use_sampling=False,
+            profile=True,
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert synchronize_calls == [torch.device("cpu"), torch.device("cpu")]
+    assert captured.out == ""
+    assert "[muscriptor] encode conditions (total):" in captured.err
+
+
+def test_generate_forwards_profile_to_the_condition_provider(tiny_model, monkeypatch):
+    profiles = []
+    original_forward = tiny_model.condition_provider.forward
+
+    def record_profile(tokenized, profile=False):
+        profiles.append(profile)
+        return original_forward(tokenized, profile=profile)
+
+    monkeypatch.setattr(tiny_model.condition_provider, "forward", record_profile)
+
+    list(
+        tiny_model.generate(
+            conditions=[ConditioningAttributes()],
+            max_gen_len=2,
+            use_sampling=False,
+            profile=True,
+        )
+    )
+
+    assert profiles == [True]
 
 
 def test_generate_with_own_greedy_prefix_as_prompt_is_a_noop(tiny_model):

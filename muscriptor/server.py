@@ -112,7 +112,12 @@ def event_to_dict(ev: NoteStartEvent | NoteEndEvent) -> dict:
     }
 
 
-def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> FastAPI:
+def create_app(
+    model: TranscriptionModel,
+    web_dir: str | Path | None = None,
+    *,
+    profile: bool = False,
+) -> FastAPI:
     app = FastAPI(title="muscriptor")
 
     transcribe_lock = threading.Lock()
@@ -270,6 +275,7 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
                     instruments=instruments or None,
                     batch_size=1,
                     no_eos_is_ok=True,
+                    profile=profile,
                 ):
                     # A newer request preempted this run — stop generating
                     # (closing the model.transcribe generator) and release the
@@ -403,6 +409,7 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
                 (wav, sr),
                 instruments=instruments or None,
                 detect_tempo=detect_tempo,
+                profile=profile,
             )
         except BeatDetectionError as e:
             # Only reachable with detect_tempo=true, where the caller wants an error
