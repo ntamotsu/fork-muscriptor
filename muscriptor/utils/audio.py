@@ -2,13 +2,25 @@
 other formats fall back to `soundfile`."""
 
 import wave
+from collections import OrderedDict
 from pathlib import Path
+from threading import Lock
 from typing import IO
 
 import numpy as np
 import torch
 
-from muscriptor.utils.resample import resample_frac
+from muscriptor.utils.resample import (
+    ResampleFrac as _ResampleFrac,
+    resample_frac as resample_frac,
+)
+
+
+_RESAMPLER_CACHE_MAX_SIZE = 8
+_RESAMPLER_CACHE: OrderedDict[
+    tuple[int, int, torch.device, torch.dtype], _ResampleFrac
+] = OrderedDict()
+_RESAMPLER_CACHE_LOCK = Lock()
 
 
 def _read_wav_file(source) -> tuple[torch.Tensor, int]:
@@ -83,10 +95,26 @@ def resample(
     orig_freq: int,
     new_freq: int,
 ) -> torch.Tensor:
-    """Sinc resampler via julius `resample_frac`. Operates along the last dim."""
+    """最終次元を対象に、再利用可能なsinc kernelでリサンプリングする。"""
     if orig_freq == new_freq:
         return waveform
-    return resample_frac(waveform, int(orig_freq), int(new_freq))
+    orig_freq = int(orig_freq)
+    new_freq = int(new_freq)
+    key = (orig_freq, new_freq, waveform.device, waveform.dtype)
+    with _RESAMPLER_CACHE_LOCK:
+        resampler = _RESAMPLER_CACHE.get(key)
+        if resampler is None:
+            resampler = _ResampleFrac(orig_freq, new_freq).to(
+                device=waveform.device,
+                dtype=waveform.dtype,
+            )
+            _RESAMPLER_CACHE[key] = resampler
+            if len(_RESAMPLER_CACHE) > _RESAMPLER_CACHE_MAX_SIZE:
+                _RESAMPLER_CACHE.popitem(last=False)
+        else:
+            _RESAMPLER_CACHE.move_to_end(key)
+    # forwardはcacheを更新しないため、lock外で並行実行できる。
+    return resampler(waveform)
 
 
 def load_audio(path: str | Path, target_sr: int = 16000) -> torch.Tensor:
