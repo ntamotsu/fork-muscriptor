@@ -28,6 +28,14 @@ from muscriptor.utils.sheets import MuseScoreError, MuseScoreNotFoundError
 FAKE_MIDI = b"FAKE_MIDI_BYTES"
 
 
+def _bind_base_audio_entrypoints(model):
+    """prepared高速経路を表すmockへ基底の公開entrypointを束縛する。"""
+    model.transcribe = TranscriptionModel.transcribe.__get__(model, TranscriptionModel)
+    model.detect_beat_grid_for = TranscriptionModel.detect_beat_grid_for.__get__(
+        model, TranscriptionModel
+    )
+
+
 def make_model(events=(), midi=FAKE_MIDI):
     """A mock standing in for TranscriptionModel.
 
@@ -41,6 +49,7 @@ def make_model(events=(), midi=FAKE_MIDI):
     model._detect_beat_grid_prepared.return_value = None
     model.events_to_midi_bytes.return_value = midi
     model.transcribe_to_midi.return_value = midi
+    _bind_base_audio_entrypoints(model)
     return model
 
 
@@ -132,6 +141,86 @@ def test_transcribe_streams_sse_events(tmp_path):
         "beat_grid": None,
     }
     assert model._transcribe_prepared.call_count == 1
+
+
+def test_transcribe_stream_supports_a_public_only_adapter(tmp_path):
+    start = NoteStartEvent(pitch=60, start_time=0.0, index=0, instrument="piano")
+    end = NoteEndEvent(end_time=0.5, start_event=start)
+
+    class PublicOnlyAdapter:
+        def __init__(self):
+            self.calls = []
+
+        def transcribe(
+            self,
+            audio,
+            *,
+            instruments,
+            batch_size,
+            no_eos_is_ok,
+            profile,
+        ):
+            self.calls.append(
+                (
+                    "transcribe",
+                    audio,
+                    instruments,
+                    batch_size,
+                    no_eos_is_ok,
+                    profile,
+                )
+            )
+            return iter((start, end))
+
+        def detect_beat_grid_for(self, audio, mode="best-effort"):
+            self.calls.append(("detect", audio, mode))
+            return None
+
+        def events_to_midi_bytes(self, events, beat_grid=None):
+            self.calls.append(("midi", list(events), beat_grid))
+            return FAKE_MIDI
+
+    model = PublicOnlyAdapter()
+    client = TestClient(create_app(model, profile=True))
+
+    response = client.post(
+        "/transcribe",
+        files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
+        data={"instruments": ["violin"], "detect_tempo": "false"},
+    )
+
+    assert response.status_code == 200
+    assert _parse_sse(response.text)[-1]["type"] == "transcription_complete"
+    assert [call[0] for call in model.calls] == ["transcribe", "detect", "midi"]
+    assert model.calls[0][2:] == (["violin"], 1, True, True)
+    assert model.calls[1][2] is False
+    assert model.calls[2][1:] == ([start, end], None)
+
+
+def test_transcribe_stream_honors_one_public_override_on_a_subclass(tmp_path):
+    class PublicTranscribeOverride(TranscriptionModel):
+        def __init__(self):
+            self.calls = []
+
+        def transcribe(self, audio, **kwargs):
+            self.calls.append(("transcribe", audio, kwargs))
+            return iter(())
+
+        def events_to_midi_bytes(self, events, beat_grid=None):
+            self.calls.append(("midi", list(events), beat_grid))
+            return FAKE_MIDI
+
+    model = PublicTranscribeOverride()
+    response = TestClient(create_app(model)).post(
+        "/transcribe",
+        files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
+        data={"detect_tempo": "false"},
+    )
+
+    assert response.status_code == 200
+    assert [call[0] for call in model.calls] == ["transcribe", "midi"]
+    assert model.calls[0][2]["profile"] is False
+    assert model.calls[1][1:] == ([], None)
 
 
 def test_transcribe_stream_preserves_profile_and_progress_logging(tmp_path, capsys):
@@ -487,7 +576,59 @@ def _blocking_transcribe_model(first_reached: threading.Event, gate: threading.E
     model._transcribe_prepared.side_effect = side_effect
     model.events_to_midi_bytes.return_value = FAKE_MIDI
     model._detect_beat_grid_prepared.return_value = None
+    _bind_base_audio_entrypoints(model)
     return model, s0
+
+
+def _blocking_public_adapter(
+    first_reached: threading.Event,
+    gate: threading.Event,
+    closed: threading.Event,
+):
+    start = NoteStartEvent(pitch=60, start_time=0.0, index=0, instrument="piano")
+    end = NoteEndEvent(end_time=0.5, start_event=start)
+
+    class BlockingIterator:
+        def __init__(self):
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.index += 1
+            if self.index == 1:
+                return start
+            if self.index == 2:
+                first_reached.set()
+                assert gate.wait(timeout=10), "gate never opened"
+                return end
+            raise StopIteration
+
+        def close(self):
+            closed.set()
+
+    class PublicOnlyAdapter:
+        def __init__(self):
+            self.calls = 0
+            self.call_lock = threading.Lock()
+
+        def transcribe(self, _audio, **_kwargs):
+            with self.call_lock:
+                self.calls += 1
+                first = self.calls == 1
+            return BlockingIterator() if first else iter((start, end))
+
+        @staticmethod
+        def detect_beat_grid_for(_audio, _mode="best-effort"):
+            return None
+
+        @staticmethod
+        def events_to_midi_bytes(_events, beat_grid=None):
+            assert beat_grid is None
+            return FAKE_MIDI
+
+    return PublicOnlyAdapter(), start
 
 
 def _post_transcribe(app, payload, client_id, out, name):
@@ -585,6 +726,36 @@ def test_concurrent_same_client_preempts(tmp_path):
     # B (the resubmit) ran to completion.
     assert out["B"][-1]["type"] == "transcription_complete"
     assert model._transcribe_prepared.call_count == 2
+
+
+def test_same_client_preemption_closes_a_public_transcription_iterator(tmp_path):
+    first_reached = threading.Event()
+    gate = threading.Event()
+    closed = threading.Event()
+    model, _start = _blocking_public_adapter(first_reached, gate, closed)
+    app = create_app(model)
+    payload = _wav_bytes(tmp_path)
+    out = {}
+
+    first = threading.Thread(
+        target=_post_transcribe,
+        args=(app, payload, "same-tab", out, "first"),
+    )
+    first.start()
+    assert first_reached.wait(timeout=5)
+
+    replacement = threading.Thread(
+        target=_post_transcribe,
+        args=(app, payload, "same-tab", out, "replacement"),
+    )
+    replacement.start()
+    time.sleep(0.5)
+    gate.set()
+    first.join(timeout=10)
+    replacement.join(timeout=10)
+
+    assert closed.is_set()
+    assert out["replacement"][-1]["type"] == "transcription_complete"
 
 
 # ---- /sheets ------------------------------------------------------------

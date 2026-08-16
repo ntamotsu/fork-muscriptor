@@ -505,6 +505,87 @@ def test_midi_prepares_audio_once_and_shares_the_same_tensor(monkeypatch):
     assert model.transcription_wavs == [model.prepared]
 
 
+def test_inherited_midi_dispatches_to_public_overrides_without_private_state():
+    calls = []
+    audio = (torch.zeros(1, 16_000), 16_000)
+
+    class PublicOnlyTranscriber(TranscriptionModel):
+        def __init__(self):
+            pass
+
+        def detect_beat_grid_for(self, received_audio, mode="best-effort"):
+            calls.append(("detect", received_audio, mode))
+            return "public-grid"
+
+        def transcribe(self, received_audio, **kwargs):
+            calls.append(("transcribe", received_audio, kwargs))
+            return iter(("public-event",))
+
+        def events_to_midi_bytes(self, events, beat_grid=None):
+            calls.append(("midi", list(events), beat_grid))
+            return b"PUBLIC_MIDI"
+
+    result = PublicOnlyTranscriber().transcribe_to_midi(
+        audio,
+        use_sampling=True,
+        temperature=0.5,
+        cfg_coef=2.0,
+        instruments=["piano"],
+        batch_size=3,
+        no_eos_is_ok=False,
+        beam_size=2,
+        prelude_forcing=False,
+        detect_tempo=True,
+        profile=True,
+        log_progress=False,
+    )
+
+    assert result == b"PUBLIC_MIDI"
+    assert calls == [
+        ("detect", audio, True),
+        (
+            "transcribe",
+            audio,
+            {
+                "use_sampling": True,
+                "temperature": 0.5,
+                "cfg_coef": 2.0,
+                "instruments": ["piano"],
+                "batch_size": 3,
+                "no_eos_is_ok": False,
+                "beam_size": 2,
+                "prelude_forcing": False,
+                "profile": True,
+                "log_progress": False,
+            },
+        ),
+        ("midi", ["public-event"], "public-grid"),
+    ]
+
+
+def test_midi_detects_public_entrypoints_replaced_on_one_instance(monkeypatch):
+    model = _PreparedAudioRecorder()
+    calls = []
+    audio = (torch.zeros(1, 16_000), 16_000)
+
+    def detect(received_audio, mode="best-effort"):
+        calls.append(("detect", received_audio, mode))
+        return "beat-grid"
+
+    def transcribe(received_audio, **_kwargs):
+        calls.append(("transcribe", received_audio))
+        return iter(("public-event",))
+
+    monkeypatch.setattr(model, "detect_beat_grid_for", detect)
+    monkeypatch.setattr(model, "transcribe", transcribe)
+
+    result = model.transcribe_to_midi(audio, detect_tempo=True)
+
+    assert result == b"MIDI"
+    assert calls == [("detect", audio, True), ("transcribe", audio)]
+    assert (model.load_calls, model.transcription_wavs) == (0, [])
+
+
 def test_transcribe_forwards_profile_to_token_generation(monkeypatch):
     monkeypatch.setattr(
         "muscriptor.transcription_model.muscriptor.accelerator.synchronize",

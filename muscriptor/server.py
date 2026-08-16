@@ -266,44 +266,63 @@ def create_app(
 
         def gen():
             try:
-                with profile_timed(
-                    profile,
-                    "load audio",
-                    device=model._device,
-                ):
-                    prepared_wav = model._prepare_audio((wav, sr))
+                audio = (wav, sr)
+                use_prepared_audio = (
+                    TranscriptionModel._can_use_prepared_audio_fast_path(model)
+                )
                 events: list[NoteStartEvent | NoteEndEvent] = []
                 # batch_size=1 so each chunk's notes stream out as soon as it is
                 # generated, instead of waiting for a whole batch of chunks.
                 # no_eos_is_ok=True so one runaway chunk that never emits EOS only
                 # warns (and keeps its notes) instead of aborting the whole stream.
-                for ev in model._transcribe_prepared(
-                    prepared_wav,
-                    instruments=instruments or None,
-                    batch_size=1,
-                    no_eos_is_ok=True,
-                    profile=profile,
-                    log_progress=True,
-                ):
-                    # 新しいrequestにpreemptされたらprepared採譜generatorを閉じ、
-                    # finallyでlockを解放する。停止はsignal後最大1 chunk遅れる。
-                    if cancel.is_set():
-                        return
-                    if isinstance(ev, ProgressEvent):
-                        # Coarse chunk-completion anchor — forward it but keep it
-                        # out of the note list the MIDI file is built from.
-                        payload = json.dumps(
-                            {
-                                "type": "progress",
-                                "completed": ev.completed,
-                                "total": ev.total,
-                            }
-                        )
+                if use_prepared_audio:
+                    with profile_timed(
+                        profile,
+                        "load audio",
+                        device=model._device,
+                    ):
+                        prepared_wav = model._prepare_audio(audio)
+                    event_stream = model._transcribe_prepared(
+                        prepared_wav,
+                        instruments=instruments or None,
+                        batch_size=1,
+                        no_eos_is_ok=True,
+                        profile=profile,
+                        log_progress=True,
+                    )
+                else:
+                    event_stream = model.transcribe(
+                        audio,
+                        instruments=instruments or None,
+                        batch_size=1,
+                        no_eos_is_ok=True,
+                        profile=profile,
+                    )
+                try:
+                    for ev in event_stream:
+                        # 新しいrequestにpreemptされたら採譜iteratorを閉じ、
+                        # finallyでlockを解放する。停止はsignal後最大1 chunk遅れる。
+                        if cancel.is_set():
+                            return
+                        if isinstance(ev, ProgressEvent):
+                            # Coarse chunk-completion anchor — forward it but keep it
+                            # out of the note list the MIDI file is built from.
+                            payload = json.dumps(
+                                {
+                                    "type": "progress",
+                                    "completed": ev.completed,
+                                    "total": ev.total,
+                                }
+                            )
+                            yield f"data: {payload}\n\n"
+                            continue
+                        events.append(ev)
+                        payload = json.dumps(event_to_dict(ev))
                         yield f"data: {payload}\n\n"
-                        continue
-                    events.append(ev)
-                    payload = json.dumps(event_to_dict(ev))
-                    yield f"data: {payload}\n\n"
+                finally:
+                    close = getattr(event_stream, "close", None)
+                    if callable(close):
+                        close()
                 # All notes streamed — build the MIDI file in memory (reusing the
                 # exact `muscriptor transcribe` logic) and send it as a final event
                 # with the bytes base64-encoded.
@@ -311,10 +330,13 @@ def create_app(
                     return
                 # Detect tempo/meter only now: it costs a few seconds of CPU and
                 # nothing before this point needs it, so the notes stream first.
-                grid = model._detect_beat_grid_prepared(
-                    prepared_wav,
-                    detect_tempo,
-                )
+                if use_prepared_audio:
+                    grid = model._detect_beat_grid_prepared(
+                        prepared_wav,
+                        detect_tempo,
+                    )
+                else:
+                    grid = model.detect_beat_grid_for(audio, detect_tempo)
                 # Measure the onset lag up here rather than leaving it to the MIDI
                 # writing, since the UI has to be told the very same number to move
                 # the notes it already drew.

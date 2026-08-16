@@ -35,8 +35,8 @@ class _FakeModel:
     def load_model(cls, **_):
         return cls()
 
-    def transcribe(self, **kwargs):
-        type(self).last_kwargs = kwargs
+    def transcribe(self, audio=None, **kwargs):
+        type(self).last_kwargs = {"audio": audio, **kwargs}
         s0 = NoteStartEvent(pitch=60, start_time=0.0, index=0, instrument="piano")
         s1 = NoteStartEvent(pitch=64, start_time=0.5, index=1, instrument="guitar")
         yield s0

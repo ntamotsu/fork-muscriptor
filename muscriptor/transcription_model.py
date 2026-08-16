@@ -629,6 +629,19 @@ class TranscriptionModel:
             yield ProgressEvent(completed=batch_start + n, total=num_chunks)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _can_use_prepared_audio_fast_path(instance: object) -> bool:
+        """公開音声entrypointが基底実装のままかを判定する。"""
+
+        def is_base_method(name: str) -> bool:
+            method = getattr(instance, name, None)
+            return getattr(method, "__self__", None) is instance and getattr(
+                method, "__func__", None
+            ) is getattr(TranscriptionModel, name)
+
+        return is_base_method("transcribe") and is_base_method("detect_beat_grid_for")
+
+    # ------------------------------------------------------------------
     def transcribe_to_midi(
         self,
         audio: str | Path | tuple[torch.Tensor, int],
@@ -645,6 +658,23 @@ class TranscriptionModel:
         log_progress: bool = True,
     ) -> bytes:
         """Same as :meth:`transcribe` but returns a MIDI file as bytes."""
+        if not TranscriptionModel._can_use_prepared_audio_fast_path(self):
+            beat_grid = self.detect_beat_grid_for(audio, detect_tempo)
+            events = self.transcribe(
+                audio,
+                use_sampling=use_sampling,
+                temperature=temperature,
+                cfg_coef=cfg_coef,
+                instruments=instruments,
+                batch_size=batch_size,
+                no_eos_is_ok=no_eos_is_ok,
+                beam_size=beam_size,
+                prelude_forcing=prelude_forcing,
+                profile=profile,
+                log_progress=log_progress,
+            )
+            return self.events_to_midi_bytes(events, beat_grid=beat_grid)
+
         with profile_timed(profile, "load audio", device=self._device):
             wav = self._prepare_audio(audio)
         beat_grid = self._detect_beat_grid_prepared(wav, detect_tempo)
