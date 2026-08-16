@@ -18,6 +18,9 @@ from muscriptor.benchmark import (
     BenchmarkSample,
     BenchmarkWorkload,
     EventCounts,
+    GateStatus,
+    GoldenPolicy,
+    compare_reports,
 )
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
 from muscriptor.generation_telemetry import ChunkGenerationStats
@@ -222,6 +225,7 @@ def test_run_writes_a_report_without_real_inference(monkeypatch, tmp_path):
         sample["chunk_generation_stats"] is None for sample in payload["samples"]
     )
     assert payload["environment"]["name"] == "test-cpu"
+    assert payload["source"]["decoding_implementation"] == "scalar-v1"
     assert payload["workload"]["parameters"]["audio"]["num_samples"] == 16_000
     assert payload["workload"]["parameters"]["model"]["config"] == {
         "effective": {"card": 1393, "dim": 64, "num_heads": 4, "num_layers": 2},
@@ -246,6 +250,136 @@ def test_run_writes_a_report_without_real_inference(monkeypatch, tmp_path):
         "profile": False,
         "log_progress": False,
     }
+
+
+def test_run_enables_speculative_decoding_without_changing_semantic_workload(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _FakeModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+    monkeypatch.setattr(
+        benchmark_cli,
+        "_require_base_speculative_model",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(benchmark_cli, "_source_metadata", lambda: {})
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [*_run_args(audio, weights, output), "--speculative-decoding"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text())
+    assert _FakeModel.transcribe_kwargs == {
+        **benchmark_cli._TRANSCRIBE_PARAMETERS,
+        "speculative_decoding": True,
+    }
+    assert payload["workload"]["parameters"]["transcribe"] == (
+        benchmark_cli._TRANSCRIBE_PARAMETERS
+    )
+    assert payload["protocol"]["generation_telemetry"] == "none"
+    assert payload["source"]["decoding_implementation"] == "history-ngram-v1"
+
+
+def test_speculative_benchmark_help_warns_that_some_audio_can_be_slower():
+    result = CliRunner().invoke(benchmark_cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "slower when" in " ".join(result.output.split())
+
+
+def test_run_rejects_speculative_decoding_outside_the_loaded_model_matrix(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    model = object.__new__(benchmark_cli.TranscriptionModel)
+    model._device = torch.device("cpu")
+    model._model = object()
+    monkeypatch.setattr(
+        benchmark_cli.TranscriptionModel,
+        "load_model",
+        classmethod(lambda _cls, **_kwargs: model),
+    )
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [*_run_args(audio, weights, output), "--speculative-decoding"],
+    )
+
+    assert result.exit_code != 0
+    assert "--speculative-decoding" in result.output
+    assert "large float16 model on MPS" in result.output
+    assert not output.exists()
+
+
+def test_scalar_and_speculative_reports_remain_comparison_compatible(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    scalar_output = tmp_path / "scalar.json"
+    speculative_output = tmp_path / "speculative.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _FakeModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+    monkeypatch.setattr(
+        benchmark_cli,
+        "_require_base_speculative_model",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(benchmark_cli, "_source_metadata", lambda: {})
+
+    scalar_result = CliRunner().invoke(
+        benchmark_cli.app,
+        _run_args(audio, weights, scalar_output),
+    )
+    speculative_result = CliRunner().invoke(
+        benchmark_cli.app,
+        [
+            *_run_args(audio, weights, speculative_output),
+            "--speculative-decoding",
+        ],
+    )
+
+    assert scalar_result.exit_code == 0, scalar_result.output
+    assert speculative_result.exit_code == 0, speculative_result.output
+    scalar = BenchmarkReport.from_json(scalar_output.read_text())
+    speculative = BenchmarkReport.from_json(speculative_output.read_text())
+    comparison = compare_reports(
+        speculative,
+        scalar,
+        GoldenPolicy(max_median_regression_percent=1_000_000),
+    )
+    assert speculative.workload == scalar.workload
+    assert speculative.protocol == scalar.protocol
+    assert comparison.status is GateStatus.PASS
 
 
 def test_run_forwards_canonical_instruments_and_allow_no_eos_to_the_workload(
@@ -362,9 +496,17 @@ def test_strict_eos_failure_keeps_an_existing_force_target(monkeypatch, tmp_path
         )
     ],
 )
-def test_generation_telemetry_detects_class_and_instance_method_overrides(
+@pytest.mark.parametrize(
+    "validator_name",
+    [
+        "_require_base_generation_telemetry_model",
+        "_require_base_speculative_model",
+    ],
+)
+def test_private_benchmark_paths_detect_class_and_instance_method_overrides(
     override_scope,
     method_name,
+    validator_name,
 ):
     def override(self, *_args, **_kwargs):
         return None
@@ -381,7 +523,34 @@ def test_generation_telemetry_detects_class_and_instance_method_overrides(
         setattr(model, method_name, types.MethodType(override, model))
 
     with pytest.raises(typer.BadParameter, match=method_name):
-        benchmark_cli._require_base_generation_telemetry_model(model)
+        getattr(benchmark_cli, validator_name)(model)
+
+
+@pytest.mark.parametrize("override_scope", ["class", "instance"])
+@pytest.mark.parametrize(
+    "method_name",
+    ["_validate_speculative_request", "_validate_speculative_ngram"],
+)
+def test_speculative_benchmark_detects_validator_overrides(
+    override_scope,
+    method_name,
+):
+    def override(self, **_kwargs):
+        return None
+
+    if override_scope == "class":
+        model_type = type(
+            "OverriddenTranscriptionModel",
+            (benchmark_cli.TranscriptionModel,),
+            {method_name: override},
+        )
+        model = object.__new__(model_type)
+    else:
+        model = object.__new__(benchmark_cli.TranscriptionModel)
+        setattr(model, method_name, types.MethodType(override, model))
+
+    with pytest.raises(typer.BadParameter, match=method_name):
+        benchmark_cli._require_base_speculative_model(model)
 
 
 def test_generation_telemetry_uses_prepared_audio_and_records_v2_chunk_stats(
@@ -448,6 +617,56 @@ def test_generation_telemetry_uses_prepared_audio_and_records_v2_chunk_stats(
         * 2,
         [expected_parameters] * 3,
     )
+
+
+def test_speculative_generation_telemetry_uses_the_private_prepared_opt_in(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    _TelemetryFakeModel.prepared_kwargs = []
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _TelemetryFakeModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "_require_base_generation_telemetry_model",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(
+        benchmark_cli,
+        "_require_base_speculative_model",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+    monkeypatch.setattr(benchmark_cli, "_source_metadata", lambda: {})
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [
+            *_run_args(audio, weights, output),
+            "--generation-telemetry",
+            "--speculative-decoding",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text())
+    assert (
+        _TelemetryFakeModel.prepared_kwargs
+        == [{**benchmark_cli._TRANSCRIBE_PARAMETERS, "_speculative_ngram": True}] * 3
+    )
+    assert payload["workload"]["parameters"]["transcribe"] == (
+        benchmark_cli._TRANSCRIBE_PARAMETERS
+    )
+    assert payload["protocol"]["generation_telemetry"] == "selected-output-v1"
+    assert payload["source"]["decoding_implementation"] == "history-ngram-v1"
 
 
 def test_run_preserves_hf_snapshot_paths_for_adjacent_symlinked_config(

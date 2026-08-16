@@ -67,6 +67,40 @@ means pass, 1 means a digest or timing failure, 2 means invalid command input, a
 and weight files happens outside the timed region but can still take noticeable
 wall-clock time.
 
+### Compare scalar and speculative decoding
+
+History n-gram speculative decoding is an experimental, output-preserving
+implementation choice for the large float16 model on MPS. The benchmark command
+already fixes the other verified settings: greedy decoding, batch size 1, CFG 1,
+prelude forcing, and profiling disabled. Unsupported loaded models or devices are
+rejected instead of silently falling back to scalar decoding.
+
+First record the scalar golden with the same large model and arguments shown
+below, but omit `--speculative-decoding` and write it to a different output path.
+Then record the speculative candidate:
+
+```console
+uv run muscriptor-benchmark run /path/to/song.wav \
+  --model /path/to/muscriptor-large/model.safetensors \
+  --model-label large \
+  --audio-id song-long-v1 \
+  --device mps \
+  --dtype float16 \
+  --environment m4-pro-macos \
+  --speculative-decoding \
+  --output artifacts/m4-large-speculative.json
+```
+
+The implementation choice is deliberately excluded from the semantic workload
+and protocol identities, so the scalar and speculative reports remain directly
+comparable. It is still recorded in source metadata as
+`"decoding_implementation": "scalar-v1"` or
+`"decoding_implementation": "history-ngram-v1"`. The normal digest checks
+therefore remain responsible for proving output equivalence before the timing
+result is accepted. Speedup depends on how often prior token history can provide
+an accepted draft; material with frequent misses can be slower. Measure it
+separately for each workload rather than assuming a uniform speedup.
+
 OS, Python, PyTorch, device, precision, and execution-policy metadata are part of
 the environment identity. Regenerate the device-specific golden after changing
 any of them, including a macOS update. On MPS, consider `--warmup-runs 2` if the
@@ -126,6 +160,10 @@ uv run muscriptor-benchmark run /path/to/song-drums-native-f32.wav \
   --allow-no-eos \
   --output artifacts/m4-large-drums-telemetry.json
 ```
+
+Add `--speculative-decoding` to the same command to collect the equivalent
+per-chunk telemetry while the history n-gram implementation is enabled. Keep all
+other arguments identical when comparing it with the scalar report.
 
 `--allow-no-eos` is a diagnostic opt-in. Without it, strict EOS checking remains
 the default: a chunk that reaches the 2000-token limit aborts the command and no

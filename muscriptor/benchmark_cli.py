@@ -56,6 +56,13 @@ _BASE_TRANSCRIPTION_METHODS = {
     name: inspect.getattr_static(TranscriptionModel, name)
     for name in ("transcribe", "_transcribe_prepared", "_generate_token_stream")
 }
+_BASE_SPECULATIVE_METHODS = {
+    **_BASE_TRANSCRIPTION_METHODS,
+    **{
+        name: inspect.getattr_static(TranscriptionModel, name)
+        for name in ("_validate_speculative_request", "_validate_speculative_ngram")
+    },
+}
 
 
 @app.callback()
@@ -285,21 +292,53 @@ def _strict_synchronize(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
-def _require_base_generation_telemetry_model(model: object) -> None:
+def _overridden_base_transcription_methods(
+    model: object,
+    expected_methods: dict[str, object] = _BASE_TRANSCRIPTION_METHODS,
+) -> list[str]:
     overridden: list[str] = []
-    for name, base_method in _BASE_TRANSCRIPTION_METHODS.items():
+    for name, base_method in expected_methods.items():
         method = getattr(model, name, None)
         if (
             getattr(method, "__self__", None) is not model
             or getattr(method, "__func__", None) is not base_method
         ):
             overridden.append(name)
+    return overridden
+
+
+def _require_base_generation_telemetry_model(model: object) -> None:
+    overridden = _overridden_base_transcription_methods(model)
     if overridden:
         raise typer.BadParameter(
             "--generation-telemetry requires base TranscriptionModel "
             "implementations for transcribe, _transcribe_prepared, and "
             f"_generate_token_stream; overridden or missing: {', '.join(overridden)}"
         )
+
+
+def _require_base_speculative_model(model: object) -> None:
+    overridden = _overridden_base_transcription_methods(
+        model, _BASE_SPECULATIVE_METHODS
+    )
+    if overridden:
+        raise typer.BadParameter(
+            "--speculative-decoding requires base TranscriptionModel methods; "
+            f"overridden or missing: {', '.join(overridden)}"
+        )
+    try:
+        model._validate_speculative_request(
+            use_sampling=False,
+            cfg_coef=1.0,
+            batch_size=1,
+            beam_size=1,
+            prelude_forcing=True,
+            profile=False,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(
+            str(error), param_hint="--speculative-decoding"
+        ) from error
 
 
 @app.command("run")
@@ -389,6 +428,19 @@ def run_command(
             help="Record per-chunk selected-output generation statistics.",
         ),
     ] = False,
+    speculative_decoding: Annotated[
+        bool,
+        typer.Option(
+            "--speculative-decoding",
+            help=(
+                "Use verified output-preserving history n-gram speculative "
+                "decoding. Some audio may be slower when drafts often miss. "
+                "Requires the large float16 model on MPS; the benchmark already "
+                "fixes greedy decoding, batch size 1, CFG 1, prelude forcing, "
+                "and profiling off."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """モデルを一度だけ読み込み、転写streamを最後まで消費する時間を測る。"""
     if dtype not in {"float32", "float16", "bfloat16"}:
@@ -409,6 +461,9 @@ def run_command(
         "instruments": instrument_names,
         "no_eos_is_ok": allow_no_eos,
     }
+    runtime_transcribe_parameters = dict(transcribe_parameters)
+    if speculative_decoding:
+        runtime_transcribe_parameters["speculative_decoding"] = True
 
     torch_device = _parse_device(device)
     audio_file = audio_file.resolve()
@@ -447,6 +502,8 @@ def run_command(
     )
     if generation_telemetry:
         _require_base_generation_telemetry_model(model)
+    if speculative_decoding:
+        _require_base_speculative_model(model)
 
     model_name = model_label or model_path.stem
     input_name = audio_id or audio_file.name
@@ -481,19 +538,26 @@ def run_command(
     )
 
     def instrumented_stream(observer):
+        private_options = {"_speculative_ngram": True} if speculative_decoding else {}
         return model._transcribe_prepared(
             wav,
             **transcribe_parameters,
             _generation_observer=observer,
+            **private_options,
         )
 
     report = run_benchmark(
-        lambda: model.transcribe((wav, 16_000), **transcribe_parameters),
+        lambda: model.transcribe((wav, 16_000), **runtime_transcribe_parameters),
         workload=workload,
         environment=benchmark_environment,
         protocol=protocol,
         synchronize=lambda: _strict_synchronize(torch_device),
-        source=_source_metadata(),
+        source={
+            **_source_metadata(),
+            "decoding_implementation": (
+                "history-ngram-v1" if speculative_decoding else "scalar-v1"
+            ),
+        },
         instrumented_event_stream_factory=(
             instrumented_stream if generation_telemetry else None
         ),
