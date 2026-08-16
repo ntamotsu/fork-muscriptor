@@ -343,6 +343,7 @@ class LMModel(nn.Module):
         profile: bool = False,
         _draft_provider: Callable[[], tuple[int, ...] | None] | None = None,
         _speculative_stop_token: int | None = None,
+        _draft_feedback: Callable[[int, int], None] | None = None,
     ) -> Iterator[torch.Tensor]:
         """Autoregressively generate tokens, yielding one timestep at a time.
 
@@ -378,6 +379,7 @@ class LMModel(nn.Module):
         if _draft_provider is not None and not _supports_speculative_greedy(self):
             _draft_provider = None
             _speculative_stop_token = None
+            _draft_feedback = None
         if _draft_provider is not None and (
             use_sampling or beam_size != 1 or cfg_coef != 1.0 or num_samples != 1
         ):
@@ -552,6 +554,8 @@ class LMModel(nn.Module):
                                 model_state,
                                 increment=accepted,
                             )
+                            if _draft_feedback is not None:
+                                _draft_feedback(len(draft), accepted)
                             skipped_offsets = accepted - 1
                             for index in range(accepted):
                                 yield gen_sequence[:, offset + index + 1]

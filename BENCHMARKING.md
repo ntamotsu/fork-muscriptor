@@ -74,6 +74,10 @@ implementation choice for the large float16 model on MPS. The benchmark command
 already fixes the other verified settings: greedy decoding, batch size 1, CFG 1,
 prelude forcing, and profiling disabled. Unsupported loaded models or devices are
 rejected instead of silently falling back to scalar decoding.
+The implementation bounds completed-chunk history and automatically returns to
+scalar generation for the rest of a track when measured draft savings are too
+small. This limits regressions but does not remove the need for representative
+benchmarking.
 
 First record the scalar golden with the same large model and arguments shown
 below, but omit `--speculative-decoding` and write it to a different output path.

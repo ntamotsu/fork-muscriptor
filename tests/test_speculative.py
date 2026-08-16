@@ -75,6 +75,217 @@ def test_history_draft_discards_an_unfinished_chunk():
     assert draft.propose() is None
 
 
+def test_history_draft_drops_matches_older_than_eight_completed_chunks():
+    draft = HistoryNgramDraft(
+        block_size=2,
+        min_context=2,
+        max_context=2,
+    )
+
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12]:
+        draft.observe(token)
+    draft.finish_chunk()
+    for initial_token in range(200, 208):
+        draft.start_chunk(initial_token=initial_token)
+        for token in [20, 21, 22]:
+            draft.observe(token)
+        draft.finish_chunk()
+
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+
+    assert draft.propose() is None
+
+
+def test_history_draft_keeps_the_eighth_most_recent_completed_chunk():
+    draft = HistoryNgramDraft(
+        block_size=2,
+        min_context=2,
+        max_context=2,
+    )
+
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12]:
+        draft.observe(token)
+    draft.finish_chunk()
+    for initial_token in range(200, 207):
+        draft.start_chunk(initial_token=initial_token)
+        for token in [20, 21, 22]:
+            draft.observe(token)
+        draft.finish_chunk()
+
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+
+    assert draft.propose() == (11, 12)
+
+
+def test_history_draft_still_uses_the_active_chunk_when_history_is_full():
+    draft = HistoryNgramDraft(
+        block_size=2,
+        min_context=2,
+        max_context=2,
+        max_completed_chunks=1,
+    )
+    draft.start_chunk(initial_token=200)
+    for token in [20, 21, 22]:
+        draft.observe(token)
+    draft.finish_chunk()
+
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 99, 10]:
+        draft.observe(token)
+
+    assert draft.propose() == (11, 99)
+
+
+def test_discarded_chunk_does_not_consume_completed_history_capacity():
+    draft = HistoryNgramDraft(
+        block_size=2,
+        min_context=2,
+        max_context=2,
+        max_completed_chunks=1,
+    )
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12]:
+        draft.observe(token)
+    draft.finish_chunk()
+
+    draft.start_chunk(initial_token=200)
+    draft.observe(20)
+    draft.discard_chunk()
+
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+
+    assert draft.propose() == (11, 12)
+
+
+def test_history_draft_rejects_non_positive_completed_chunk_limit():
+    with pytest.raises(ValueError, match="max_completed_chunks"):
+        HistoryNgramDraft(max_completed_chunks=0)
+
+
+def test_history_draft_stops_after_eight_unproductive_verifications():
+    draft = HistoryNgramDraft()
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12, 13, 14]:
+        draft.observe(token)
+    draft.finish_chunk()
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+
+    for _ in range(7):
+        draft.record_block(proposed=4, committed=1)
+    assert draft.propose() == (11, 12, 13, 14)
+
+    draft.record_block(proposed=4, committed=4)
+
+    assert draft.propose() is None
+
+
+def test_history_draft_keeps_drafting_at_twelve_committed_tokens():
+    draft = HistoryNgramDraft()
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12, 13, 14]:
+        draft.observe(token)
+    draft.finish_chunk()
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+
+    for committed in [2, 1, 1, 1, 1, 1, 1, 4]:
+        draft.record_block(proposed=4, committed=committed)
+
+    assert draft.propose() == (11, 12, 13, 14)
+
+
+def test_history_draft_stops_when_the_rolling_window_falls_below_twelve():
+    draft = HistoryNgramDraft()
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12, 13, 14]:
+        draft.observe(token)
+    draft.finish_chunk()
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+    for committed in [2, 1, 1, 1, 1, 1, 1, 4]:
+        draft.record_block(proposed=4, committed=committed)
+    assert draft.propose() == (11, 12, 13, 14)
+
+    draft.record_block(proposed=4, committed=1)
+
+    assert draft.propose() is None
+
+
+def test_history_draft_reenables_drafting_for_the_next_chunk():
+    draft = HistoryNgramDraft()
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12, 13, 14]:
+        draft.observe(token)
+    draft.finish_chunk()
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+    for _ in range(8):
+        draft.record_block(proposed=4, committed=1)
+    assert draft.propose() is None
+
+    draft.finish_chunk()
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+
+    assert draft.propose() == (11, 12, 13, 14)
+
+
+def _record_track_evidence(draft, committed_tokens):
+    committed = iter(committed_tokens)
+    for _ in range(4):
+        draft.start_chunk(initial_token=99)
+        draft.observe(10)
+        for _ in range(8):
+            for _ in range(8):
+                draft.propose()
+            draft.record_block(proposed=4, committed=next(committed))
+        draft.finish_chunk()
+
+
+def test_history_draft_disables_the_track_when_cumulative_savings_are_low():
+    draft = HistoryNgramDraft()
+
+    _record_track_evidence(draft, [2] * 31 + [1])
+
+    assert draft.enabled is False
+
+
+def test_history_draft_keeps_the_track_at_the_cumulative_savings_boundary():
+    draft = HistoryNgramDraft()
+
+    _record_track_evidence(draft, [2] * 32)
+
+    assert draft.enabled is True
+
+
+def test_short_completed_chunk_does_not_consume_history_capacity():
+    draft = HistoryNgramDraft(
+        block_size=2,
+        min_context=2,
+        max_context=2,
+        max_completed_chunks=1,
+    )
+    draft.start_chunk(initial_token=99)
+    for token in [10, 11, 12]:
+        draft.observe(token)
+    draft.finish_chunk()
+
+    draft.start_chunk(initial_token=200)
+    draft.observe(20)
+    draft.finish_chunk()
+
+    draft.start_chunk(initial_token=99)
+    draft.observe(10)
+
+    assert draft.propose() == (11, 12)
+
+
 @pytest.mark.parametrize(
     ("block_size", "min_context", "max_context"),
     [(0, 2, 8), (2, 0, 8), (2, 3, 2)],
@@ -248,6 +459,39 @@ def test_speculative_greedy_matches_scalar_after_accept_or_rollback(mismatch_ind
     assert draft.calls > 0
 
 
+@pytest.mark.parametrize(
+    ("mismatch_index", "committed"),
+    [(None, 4), (0, 1), (1, 2), (3, 4)],
+)
+def test_speculative_greedy_reports_only_verified_and_committed_tokens(
+    mismatch_index,
+    committed,
+):
+    model = _tiny_lm()
+    expected = _token_ids(
+        model.generate(max_gen_len=5, num_samples=1, use_sampling=False)
+    )
+    draft = _TraceDraft(expected, mismatch_index=mismatch_index)
+    feedback = []
+
+    actual = []
+    for step in model.generate(
+        max_gen_len=5,
+        num_samples=1,
+        use_sampling=False,
+        _draft_provider=draft.propose,
+        _draft_feedback=lambda proposed, accepted: feedback.append(
+            (proposed, accepted)
+        ),
+    ):
+        token = int(step[0])
+        actual.append(token)
+        draft.observe(token)
+
+    assert actual == expected
+    assert feedback == [(4, committed)]
+
+
 def test_speculative_greedy_stops_at_eos_inside_an_accepted_block():
     model = _tiny_lm()
     expected = _token_ids(
@@ -263,6 +507,34 @@ def test_speculative_greedy_stops_at_eos_inside_an_accepted_block():
     actual, _ = _speculative_tokens(model, expected, stop_token=stop_token)
 
     assert actual == expected[: stop_index + 1]
+
+
+def test_speculative_feedback_uses_the_eos_clamped_commit_count():
+    model = _tiny_lm()
+    expected = _token_ids(
+        model.generate(max_gen_len=5, num_samples=1, use_sampling=False)
+    )
+    stop_token = expected[1]
+    draft = _TraceDraft(expected)
+    feedback = []
+    actual = []
+
+    for step in model.generate(
+        max_gen_len=5,
+        num_samples=1,
+        use_sampling=False,
+        _draft_provider=draft.propose,
+        _speculative_stop_token=stop_token,
+        _draft_feedback=lambda proposed, committed: feedback.append(
+            (proposed, committed)
+        ),
+    ):
+        token = int(step[0])
+        actual.append(token)
+        draft.observe(token)
+
+    assert actual == expected[:2]
+    assert feedback == [(4, 1)]
 
 
 def test_speculative_greedy_honours_the_existing_early_stop_token():
@@ -576,6 +848,179 @@ def test_token_stream_drafts_from_a_completed_chunk_history():
 
     # 2曲目の最初のtokenを観測した時点で、1曲目の続きがdraftになる。
     assert (11, 12, 13, 14) in proposals
+
+
+def test_token_stream_passes_verified_block_feedback_to_the_history(monkeypatch):
+    feedback = []
+
+    class RecordingHistory:
+        enabled = True
+
+        def start_chunk(self, initial_token):
+            del initial_token
+
+        def propose(self):
+            return None
+
+        def record_block(self, proposed, committed):
+            feedback.append((proposed, committed))
+
+        def observe(self, token):
+            del token
+
+        def finish_chunk(self):
+            pass
+
+        def discard_chunk(self):
+            pass
+
+    monkeypatch.setattr(transcription_module, "HistoryNgramDraft", RecordingHistory)
+
+    def generate(*, _draft_feedback=None, **_kwargs):
+        assert _draft_feedback is not None
+        _draft_feedback(4, 2)
+        yield torch.tensor([1])
+
+    fake = SimpleNamespace(
+        _model=SimpleNamespace(initial_token_id=99, generate=generate),
+        _tokenizer=SimpleNamespace(eos_id=1),
+        _device=torch.device("cpu"),
+    )
+
+    list(
+        TranscriptionModel._generate_token_stream(
+            fake,
+            [object()],
+            [0.0],
+            batch_size=1,
+            max_gen_len=16,
+            use_sampling=False,
+            temperature=1.0,
+            cfg_coef=1.0,
+            no_eos_is_ok=True,
+            prelude_forcing=False,
+            _speculative_ngram=True,
+        )
+    )
+
+    assert feedback == [(4, 2)]
+
+
+def test_token_stream_does_not_keep_a_chunk_that_never_emits_eos(monkeypatch):
+    lifecycle = []
+
+    class RecordingHistory:
+        enabled = True
+
+        def start_chunk(self, initial_token):
+            del initial_token
+
+        def propose(self):
+            return None
+
+        def record_block(self, proposed, committed):
+            del proposed, committed
+
+        def observe(self, token):
+            del token
+
+        def finish_chunk(self):
+            lifecycle.append("finish")
+
+        def discard_chunk(self):
+            lifecycle.append("discard")
+
+    monkeypatch.setattr(transcription_module, "HistoryNgramDraft", RecordingHistory)
+
+    def generate(**_kwargs):
+        yield torch.tensor([7])
+
+    fake = SimpleNamespace(
+        _model=SimpleNamespace(initial_token_id=99, generate=generate),
+        _tokenizer=SimpleNamespace(eos_id=1),
+        _device=torch.device("cpu"),
+    )
+
+    with pytest.warns(RuntimeWarning, match="did not emit EOS"):
+        list(
+            TranscriptionModel._generate_token_stream(
+                fake,
+                [object()],
+                [0.0],
+                batch_size=1,
+                max_gen_len=1,
+                use_sampling=False,
+                temperature=1.0,
+                cfg_coef=1.0,
+                no_eos_is_ok=True,
+                prelude_forcing=False,
+                _speculative_ngram=True,
+            )
+        )
+
+    assert lifecycle == ["discard"]
+
+
+def test_token_stream_omits_speculative_kwargs_after_track_disable(monkeypatch):
+    generate_kwargs = []
+
+    class DisablingHistory:
+        def __init__(self):
+            self.enabled = True
+
+        def start_chunk(self, initial_token):
+            del initial_token
+
+        def propose(self):
+            return None
+
+        def record_block(self, proposed, committed):
+            del proposed, committed
+
+        def observe(self, token):
+            del token
+
+        def finish_chunk(self):
+            self.enabled = False
+
+        def discard_chunk(self):
+            pass
+
+    monkeypatch.setattr(transcription_module, "HistoryNgramDraft", DisablingHistory)
+
+    def generate(**kwargs):
+        generate_kwargs.append(kwargs)
+        yield torch.tensor([1])
+
+    fake = SimpleNamespace(
+        _model=SimpleNamespace(initial_token_id=99, generate=generate),
+        _tokenizer=SimpleNamespace(eos_id=1),
+        _device=torch.device("cpu"),
+    )
+
+    list(
+        TranscriptionModel._generate_token_stream(
+            fake,
+            [object(), object()],
+            [0.0, 5.0],
+            batch_size=1,
+            max_gen_len=16,
+            use_sampling=False,
+            temperature=1.0,
+            cfg_coef=1.0,
+            no_eos_is_ok=True,
+            prelude_forcing=False,
+            _speculative_ngram=True,
+        )
+    )
+
+    private_keys = {
+        "_draft_provider",
+        "_draft_feedback",
+        "_speculative_stop_token",
+    }
+    assert private_keys <= generate_kwargs[0].keys()
+    assert private_keys.isdisjoint(generate_kwargs[1])
 
 
 def test_token_stream_default_does_not_pass_private_speculative_kwargs():

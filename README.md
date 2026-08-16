@@ -81,7 +81,9 @@ See `--help` for all the options.
 The large float16 model can opt into output-preserving history n-gram
 speculative decoding on MPS. Short token sequences predicted from earlier
 chunks are accepted only after the same large model verifies them, so a wrong
-prediction costs time but is not emitted as transcription output.
+prediction costs time but is not emitted as transcription output. The decoder
+keeps only recent useful history and automatically returns to scalar generation
+when draft verification or history lookup stops paying off.
 
 ```bash
 muscriptor transcribe audio.wav \

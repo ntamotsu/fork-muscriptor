@@ -363,8 +363,10 @@ class TranscriptionModel:
         the large float16 model on MPS. It predicts short token blocks from
         prior chunks, then verifies them with the same model before yielding
         anything; rejected predictions therefore do not change the decoded
-        event stream. The currently verified path requires greedy decoding,
-        batch size 1, CFG 1, prelude forcing, and profiling disabled.
+        event stream. It automatically returns to scalar generation when the
+        observed draft savings are too small. The currently verified path
+        requires greedy decoding, batch size 1, CFG 1, prelude forcing, and
+        profiling disabled.
 
         The event times may all carry the same small lag (up to ~25 ms) due to model
         bias. Taking it out needs the beat grid and every onset in the transcription,
@@ -717,11 +719,17 @@ class TranscriptionModel:
                 eos_steps: list[int | None] = [None] * n
 
             generation_options = {}
-            if draft_history is not None:
-                draft_history.start_chunk(self._model.initial_token_id)
+            active_draft = (
+                draft_history
+                if draft_history is not None and draft_history.enabled
+                else None
+            )
+            if active_draft is not None:
+                active_draft.start_chunk(self._model.initial_token_id)
                 generation_options = {
-                    "_draft_provider": draft_history.propose,
+                    "_draft_provider": active_draft.propose,
                     "_speculative_stop_token": eos_id,
+                    "_draft_feedback": active_draft.record_block,
                 }
             steps = self._model.generate(
                 prompt=prompt,
@@ -742,8 +750,8 @@ class TranscriptionModel:
             try:
                 for step in steps:
                     row = step.tolist()  # one token per chunk: [n]
-                    if draft_history is not None:
-                        draft_history.observe(row[0])
+                    if active_draft is not None:
+                        active_draft.observe(row[0])
                     if _generation_observer is not None:
                         observed_rows += 1
                         generated_step = observed_rows - prompt_tokens
@@ -777,11 +785,11 @@ class TranscriptionModel:
                 close = getattr(steps, "close", None)
                 if callable(close):
                     close()
-                if draft_history is not None:
-                    if generation_completed:
-                        draft_history.finish_chunk()
+                if active_draft is not None:
+                    if generation_completed and all(done):
+                        active_draft.finish_chunk()
                     else:
-                        draft_history.discard_chunk()
+                        active_draft.discard_chunk()
 
             if _generation_observer is not None:
                 generated_rows = max(0, observed_rows - prompt_tokens)
