@@ -62,14 +62,17 @@ class StreamingMultiheadAttention(StatefulModule):
     def increment_step(self, state: State, increment: int = 1) -> None:
         state["offset"] = state["offset"] + increment
 
-    def _complete_kv(self, k, v, state: State | None):
+    def _complete_kv(self, kv, state: State | None):
         if state is None:
-            return k, v
+            return kv[0], kv[1]
         cache = state["cache"]
         end = state["offset"]
-        T = k.shape[1]
-        cache[0, :, end : end + T] = k
-        cache[1, :, end : end + T] = v
+        T = kv.shape[2]
+        if T == 1:
+            cache[:, :, end : end + T] = kv
+        else:
+            cache[0, :, end : end + T] = kv[0]
+            cache[1, :, end : end + T] = kv[1]
         return cache[0, :, : end + T], cache[1, :, : end + T]
 
     def forward(
@@ -81,9 +84,10 @@ class StreamingMultiheadAttention(StatefulModule):
         projected = nn.functional.linear(query, self.in_proj_weight)
         B, T, _ = projected.shape
         packed = projected.reshape(B, T, 3, self.num_heads, self.dim_per_head)
-        q, k, v = packed.unbind(dim=2)
+        q = packed[:, :, 0]
+        kv = packed[:, :, 1:].permute(2, 0, 1, 3, 4)
 
-        k, v = self._complete_kv(k, v, state)
+        k, v = self._complete_kv(kv, state)
         dtype = q.dtype
 
         q_t = q.transpose(1, 2)

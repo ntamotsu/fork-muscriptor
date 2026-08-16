@@ -42,6 +42,31 @@ def test_create_sin_embedding_different_positions():
 # ---------------------------------------------------------------------------
 
 
+class _CountingCache:
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.writes = []
+
+    def __getitem__(self, key):
+        return self.tensor[key]
+
+    def __setitem__(self, key, value):
+        self.writes.append(key)
+        self.tensor[key] = value
+
+
+def _run_attention_with_counted_cache(token_count):
+    attention = StreamingMultiheadAttention(embed_dim=8, num_heads=2).eval()
+    state = init_states(attention, batch_size=1, sequence_length=3)
+    cache = _CountingCache(state[""]["cache"])
+    state[""]["cache"] = cache
+
+    with torch.no_grad():
+        output = attention(torch.randn(1, token_count, 8), model_state=state)
+
+    return output, cache
+
+
 def test_attention_state_leaves_unread_cache_uninitialized(monkeypatch):
     attention = StreamingMultiheadAttention(embed_dim=8, num_heads=2)
     expected_cache = torch.empty(2, 3, 7, 2, 4)
@@ -89,6 +114,39 @@ def test_attention_never_reads_the_unwritten_cache_tail():
     )
     assert torch.all(states[0][""]["cache"][:, :, 3:] == 123)
     assert torch.all(states[1][""]["cache"][:, :, 3:] == -456)
+
+
+def test_attention_combines_the_single_token_kv_cache_write():
+    output, cache = _run_attention_with_counted_cache(token_count=1)
+
+    assert output.shape == (1, 1, 8)
+    assert len(cache.writes) == 1
+
+
+def test_attention_single_token_kv_write_preserves_axes_and_cache_regions():
+    attention = StreamingMultiheadAttention(embed_dim=8, num_heads=2).eval()
+    packed = torch.arange(2 * 1 * 3 * 2 * 4).reshape(2, 1, 3, 2, 4)
+    kv = packed[:, :, 1:].permute(2, 0, 1, 3, 4)
+    cache_tensor = torch.full((2, 2, 5, 2, 4), -1)
+    cache_tensor[:, :, :2] = 99
+    cache = _CountingCache(cache_tensor)
+    state = {"cache": cache, "offset": 2}
+
+    k, v = attention._complete_kv(kv, state)
+
+    assert len(cache.writes) == 1
+    assert torch.equal(cache.tensor[:, :, 2:3], kv)
+    assert torch.all(cache.tensor[:, :, :2] == 99)
+    assert torch.all(cache.tensor[:, :, 3:] == -1)
+    assert torch.equal(k, cache.tensor[0, :, :3])
+    assert torch.equal(v, cache.tensor[1, :, :3])
+
+
+def test_attention_keeps_prefill_kv_cache_writes_separate():
+    output, cache = _run_attention_with_counted_cache(token_count=2)
+
+    assert output.shape == (1, 2, 8)
+    assert len(cache.writes) == 2
 
 
 def test_attention_forward_avoids_einops_in_the_decode_loop(monkeypatch):
