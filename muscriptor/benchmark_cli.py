@@ -74,6 +74,11 @@ def _sha256_tensor(tensor: torch.Tensor) -> str:
     return digest.hexdigest()
 
 
+def _absolute_lexical(path: Path) -> Path:
+    """最終symlinkを解決せず、pathを絶対化してlexicalに正規化する。"""
+    return Path(os.path.abspath(path))
+
+
 def _file_snapshot(path: Path) -> tuple[int, int, int, int]:
     metadata = path.stat()
     if not stat.S_ISREG(metadata.st_mode):
@@ -349,13 +354,13 @@ def run_command(
 
     torch_device = _parse_device(device)
     audio_file = audio_file.resolve()
-    model_path = model_path.resolve()
+    model_path = _absolute_lexical(model_path)
     config_path = model_path.parent / "config.json"
-    config_input = config_path.resolve() if config_path.exists() else None
+    config_input = config_path if config_path.exists() else None
     protected_inputs = [
         audio_file,
         model_path,
-        config_path.resolve(strict=False),
+        config_path,
     ]
     _ensure_distinct_output(output, *protected_inputs)
     _prepare_output(output, force=force)

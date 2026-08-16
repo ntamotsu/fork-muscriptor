@@ -1,6 +1,7 @@
 """実weightやacceleratorを使わないbenchmark CLIの境界テスト。"""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,26 @@ def _run_args(audio: Path, weights: Path, output: Path) -> list[str]:
         "--runs",
         "2",
     ]
+
+
+def _hf_snapshot(tmp_path: Path):
+    """HF cacheと同じsnapshotからblobへのsymlink構造を作る。"""
+    cache = tmp_path / "models--owner--muscriptor"
+    blobs = cache / "blobs"
+    snapshot = cache / "snapshots" / "revision"
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    weights_blob = blobs / "weights-hash"
+    config_blob = blobs / "config-hash"
+    weights_blob.write_bytes(b"weight bytes")
+    config_blob.write_text(
+        json.dumps({"dim": 32, "num_heads": 2, "num_layers": 1, "card": 1393})
+    )
+    snapshot_weights = snapshot / "model.safetensors"
+    snapshot_config = snapshot / "config.json"
+    snapshot_weights.symlink_to("../../blobs/weights-hash")
+    snapshot_config.symlink_to("../../blobs/config-hash")
+    return cache, snapshot_weights, snapshot_config, weights_blob, config_blob
 
 
 def test_run_requires_an_explicit_device(tmp_path):
@@ -181,6 +202,66 @@ def test_run_writes_a_report_without_real_inference(monkeypatch, tmp_path):
     }
 
 
+def test_run_preserves_hf_snapshot_paths_for_adjacent_symlinked_config(
+    monkeypatch, tmp_path
+):
+    cache, snapshot_weights, _snapshot_config, _weights_blob, config_blob = (
+        _hf_snapshot(tmp_path)
+    )
+    (cache / "snapshots" / "other").mkdir()
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _FakeModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+    monkeypatch.setattr(benchmark_cli, "_source_metadata", lambda: {})
+    relative_weights = (
+        cache.relative_to(tmp_path)
+        / "snapshots"
+        / "other"
+        / ".."
+        / "revision"
+        / "model.safetensors"
+    )
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        _run_args(audio, relative_weights, output),
+    )
+
+    payload = json.loads(output.read_text()) if output.exists() else {}
+    assert (
+        result.exit_code,
+        payload.get("workload", {})
+        .get("parameters", {})
+        .get("model", {})
+        .get("config"),
+        _FakeModel.load_kwargs,
+    ) == (
+        0,
+        {
+            "effective": {
+                "card": 1393,
+                "dim": 32,
+                "num_heads": 2,
+                "num_layers": 1,
+            },
+            "file_sha256": benchmark_cli._sha256_file(config_blob),
+            "source": "adjacent-config.json",
+        },
+        {
+            "weights_path": snapshot_weights,
+            "device": torch.device("cpu"),
+            "dtype": "float32",
+        },
+    )
+
+
 def test_run_refuses_to_overwrite_without_force(monkeypatch, tmp_path):
     audio = tmp_path / "audio.wav"
     weights = tmp_path / "model.safetensors"
@@ -261,6 +342,38 @@ def test_force_never_overwrites_an_input_file(output_source, monkeypatch, tmp_pa
     assert result.exit_code != 0
     assert "must differ" in result.output
     assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize("output_source", ["weights-target", "config-target"])
+def test_force_never_overwrites_an_hf_snapshot_symlink_target(
+    output_source, monkeypatch, tmp_path
+):
+    _cache, snapshot_weights, _snapshot_config, weights_blob, config_blob = (
+        _hf_snapshot(tmp_path)
+    )
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    output = {
+        "weights-target": weights_blob,
+        "config-target": config_blob,
+    }[output_source]
+    original = output.read_bytes()
+
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: pytest.fail("resolved input target must fail before loading"),
+    )
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [*_run_args(audio, snapshot_weights, output), "--force"],
+    )
+
+    assert (
+        result.exit_code != 0,
+        "must differ" in result.output,
+        output.read_bytes(),
+    ) == (True, True, original)
 
 
 def test_output_never_occupies_a_missing_companion_config_path(monkeypatch, tmp_path):
@@ -396,6 +509,61 @@ def test_run_rejects_an_input_changed_during_measurement(monkeypatch, tmp_path):
     assert result.exit_code != 0
     assert "changed while the benchmark ran" in result.output
     assert not output.exists()
+
+
+@pytest.mark.parametrize("retargeted_input", ["weights", "config"])
+def test_run_rejects_an_hf_snapshot_symlink_retargeted_during_measurement(
+    retargeted_input, monkeypatch, tmp_path
+):
+    cache, snapshot_weights, snapshot_config, weights_blob, config_blob = _hf_snapshot(
+        tmp_path
+    )
+    blobs = cache / "blobs"
+    if retargeted_input == "weights":
+        symlink_path = snapshot_weights
+        original_blob = weights_blob
+        new_blob = blobs / "weights-new"
+        new_target = "../../blobs/weights-new"
+    else:
+        symlink_path = snapshot_config
+        original_blob = config_blob
+        new_blob = blobs / "config-new"
+        new_target = "../../blobs/config-new"
+    new_blob.write_bytes(original_blob.read_bytes())
+    original_metadata = original_blob.stat()
+    new_metadata = new_blob.stat()
+    os.utime(
+        new_blob,
+        ns=(new_metadata.st_atime_ns, original_metadata.st_mtime_ns),
+    )
+
+    class RetargetingModel(_FakeModel):
+        def transcribe(self, audio, **kwargs):
+            symlink_path.unlink()
+            symlink_path.symlink_to(new_target)
+            yield from super().transcribe(audio, **kwargs)
+
+    audio = tmp_path / "audio.wav"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio")
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", RetargetingModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+    monkeypatch.setattr(benchmark_cli, "_source_metadata", lambda: {})
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        _run_args(audio, snapshot_weights, output),
+    )
+
+    assert (
+        result.exit_code != 0,
+        "changed while the benchmark ran" in result.output,
+        output.exists(),
+    ) == (True, True, False)
 
 
 def test_run_does_not_write_a_report_if_strict_synchronization_fails(
