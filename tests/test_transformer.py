@@ -5,6 +5,7 @@ import torch
 from muscriptor.modules.streaming import increment_steps, init_states
 from muscriptor.modules.transformer import (
     create_sin_embedding,
+    StreamingMultiheadAttention,
     StreamingTransformer,
 )
 
@@ -32,6 +33,60 @@ def test_create_sin_embedding_different_positions():
     e1 = create_sin_embedding(pos1, dim=8)
     e2 = create_sin_embedding(pos2, dim=8)
     assert not torch.allclose(e1, e2)
+
+
+# ---------------------------------------------------------------------------
+# Streaming attention state
+# ---------------------------------------------------------------------------
+
+
+def test_attention_state_leaves_unread_cache_uninitialized(monkeypatch):
+    attention = StreamingMultiheadAttention(embed_dim=8, num_heads=2)
+    expected_cache = torch.empty(2, 3, 7, 2, 4)
+    empty_calls = []
+
+    def fake_empty(*shape, **kwargs):
+        empty_calls.append((shape, kwargs))
+        return expected_cache
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+
+    state = attention.init_state(batch_size=3, sequence_length=7)
+
+    assert state["cache"] is expected_cache
+    assert state["offset"] == 0
+    assert empty_calls == [
+        (
+            ((2, 3, 7, 2, 4),),
+            {"device": attention.in_proj_weight.device, "dtype": torch.float32},
+        )
+    ]
+
+
+def test_attention_never_reads_the_unwritten_cache_tail():
+    torch.manual_seed(0)
+    attention = StreamingMultiheadAttention(embed_dim=8, num_heads=2).eval()
+    prefill = torch.randn(1, 2, 8)
+    next_token = torch.randn(1, 1, 8)
+    states = [init_states(attention, batch_size=1, sequence_length=7) for _ in range(2)]
+    states[0][""]["cache"].fill_(123)
+    states[1][""]["cache"].fill_(-456)
+
+    outputs = []
+    with torch.no_grad():
+        for state in states:
+            prefill_output = attention(prefill, model_state=state)
+            increment_steps(attention, state, increment=prefill.shape[1])
+            decode_output = attention(next_token, model_state=state)
+            outputs.append((prefill_output, decode_output))
+
+    assert torch.equal(outputs[0][0], outputs[1][0])
+    assert torch.equal(outputs[0][1], outputs[1][1])
+    assert torch.equal(
+        states[0][""]["cache"][:, :, :3], states[1][""]["cache"][:, :, :3]
+    )
+    assert torch.all(states[0][""]["cache"][:, :, 3:] == 123)
+    assert torch.all(states[1][""]["cache"][:, :, 3:] == -456)
 
 
 # ---------------------------------------------------------------------------

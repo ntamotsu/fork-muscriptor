@@ -47,9 +47,10 @@ class StreamingMultiheadAttention(StatefulModule):
     def init_state(self, batch_size: int, sequence_length: int) -> State:
         weight = self.in_proj_weight
         return {
-            "cache": torch.full(
+            # forwardは対象sliceへ書き込んでから既書込prefixだけを読むため、
+            # 未使用tailを初期値で埋める必要はない。
+            "cache": torch.empty(
                 (2, batch_size, sequence_length, self.num_heads, self.dim_per_head),
-                float("nan"),
                 device=weight.device,
                 dtype=weight.dtype,
             ),
