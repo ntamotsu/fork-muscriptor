@@ -42,6 +42,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
+from muscriptor.profiling import timed as profile_timed
 from muscriptor.soundfonts import SF3_URL
 from muscriptor.tokenizer.mt3 import MT3_FULL_PLUS_GROUP_NAMES
 from muscriptor.transcription_model import TranscriptionModel
@@ -265,21 +266,27 @@ def create_app(
 
         def gen():
             try:
+                with profile_timed(
+                    profile,
+                    "load audio",
+                    device=model._device,
+                ):
+                    prepared_wav = model._prepare_audio((wav, sr))
                 events: list[NoteStartEvent | NoteEndEvent] = []
                 # batch_size=1 so each chunk's notes stream out as soon as it is
                 # generated, instead of waiting for a whole batch of chunks.
                 # no_eos_is_ok=True so one runaway chunk that never emits EOS only
                 # warns (and keeps its notes) instead of aborting the whole stream.
-                for ev in model.transcribe(
-                    (wav, sr),
+                for ev in model._transcribe_prepared(
+                    prepared_wav,
                     instruments=instruments or None,
                     batch_size=1,
                     no_eos_is_ok=True,
                     profile=profile,
+                    log_progress=True,
                 ):
-                    # A newer request preempted this run — stop generating
-                    # (closing the model.transcribe generator) and release the
-                    # lock via the finally, at most one chunk after the signal.
+                    # 新しいrequestにpreemptされたらprepared採譜generatorを閉じ、
+                    # finallyでlockを解放する。停止はsignal後最大1 chunk遅れる。
                     if cancel.is_set():
                         return
                     if isinstance(ev, ProgressEvent):
@@ -304,7 +311,10 @@ def create_app(
                     return
                 # Detect tempo/meter only now: it costs a few seconds of CPU and
                 # nothing before this point needs it, so the notes stream first.
-                grid = model.detect_beat_grid_for((wav, sr), detect_tempo)
+                grid = model._detect_beat_grid_prepared(
+                    prepared_wav,
+                    detect_tempo,
+                )
                 # Measure the onset lag up here rather than leaving it to the MIDI
                 # writing, since the UI has to be told the very same number to move
                 # the notes it already drew.

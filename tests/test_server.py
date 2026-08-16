@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import create_autospec
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 import muscriptor.server as server_module
@@ -35,11 +36,11 @@ def make_model(events=(), midi=FAKE_MIDI):
     audio decoding are loaded.
     """
     model = create_autospec(TranscriptionModel, instance=True)
-    model.transcribe.return_value = list(events)
+    model._device = "cpu"
+    model._transcribe_prepared.return_value = list(events)
+    model._detect_beat_grid_prepared.return_value = None
     model.events_to_midi_bytes.return_value = midi
     model.transcribe_to_midi.return_value = midi
-    # No tempo by default; tests that care set a real BeatGrid.
-    model.detect_beat_grid_for.return_value = None
     return model
 
 
@@ -130,10 +131,10 @@ def test_transcribe_streams_sse_events(tmp_path):
         "data": base64.b64encode(FAKE_MIDI).decode("ascii"),
         "beat_grid": None,
     }
-    assert model.transcribe.call_count == 1
+    assert model._transcribe_prepared.call_count == 1
 
 
-def test_transcribe_stream_forwards_server_profile_setting(tmp_path):
+def test_transcribe_stream_preserves_profile_and_progress_logging(tmp_path, capsys):
     model = make_model()
     client = TestClient(create_app(model, profile=True))
 
@@ -143,13 +144,92 @@ def test_transcribe_stream_forwards_server_profile_setting(tmp_path):
     )
 
     assert response.status_code == 200
-    assert model.transcribe.call_args.kwargs.get("profile") is True
+    kwargs = model._transcribe_prepared.call_args.kwargs
+    profile_output = capsys.readouterr().err
+    assert (
+        kwargs.get("profile"),
+        kwargs.get("log_progress"),
+        profile_output.count("[muscriptor] load audio:"),
+    ) == (True, True, 1)
+
+
+def test_transcribe_prepares_audio_once_and_reuses_the_same_tensor(tmp_path):
+    import torch
+
+    model = make_model()
+    prepared = torch.zeros(1, 1600)
+    model._prepare_audio.return_value = prepared
+    client = TestClient(create_app(model))
+
+    response = client.post(
+        "/transcribe",
+        files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
+    )
+
+    transcribed = (
+        model._transcribe_prepared.call_args.args[0]
+        if model._transcribe_prepared.called
+        else None
+    )
+    detected = (
+        model._detect_beat_grid_prepared.call_args.args[0]
+        if model._detect_beat_grid_prepared.called
+        else None
+    )
+    assert (
+        response.status_code,
+        model._prepare_audio.call_count,
+        transcribed is prepared,
+        detected is prepared,
+    ) == (200, 1, True, True)
+
+
+def test_transcribe_passes_false_to_prepared_tempo_detection(tmp_path):
+    import torch
+
+    model = make_model()
+    prepared = torch.zeros(1, 1600)
+    model._prepare_audio.return_value = prepared
+    client = TestClient(create_app(model))
+
+    response = client.post(
+        "/transcribe",
+        files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
+        data={"detect_tempo": "false"},
+    )
+
+    detected_wav, mode = model._detect_beat_grid_prepared.call_args.args
+    assert (response.status_code, detected_wav is prepared, mode) == (
+        200,
+        True,
+        False,
+    )
+
+
+def test_transcribe_propagates_model_errors_and_releases_the_lock(tmp_path):
+    model = make_model()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("fake transcription failure")
+        yield
+
+    model._transcribe_prepared.side_effect = fail
+    client = TestClient(create_app(model))
+    request = {"files": {"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")}}
+
+    with pytest.raises(RuntimeError, match="fake transcription failure"):
+        client.post("/transcribe", **request)
+
+    model._transcribe_prepared.side_effect = None
+    model._transcribe_prepared.return_value = []
+    response = client.post("/transcribe", **request)
+    assert response.status_code == 200
 
 
 def test_transcribe_sends_beat_grid(tmp_path):
     """The detected grid rides along with the final MIDI event, for the UI's bar lines."""
     model = make_model()
-    model.detect_beat_grid_for.return_value = BeatGrid(
+    model._detect_beat_grid_prepared.return_value = BeatGrid(
         # A real detected grid carries `beats`, which must not reach the JSON.
         bpm=123.5,
         beats_per_bar=4,
@@ -162,14 +242,20 @@ def test_transcribe_sends_beat_grid(tmp_path):
         files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
     )
     assert resp.status_code == 200
-    assert _parse_sse(resp.text)[-1]["beat_grid"] == {
-        "bpm": 123.5,
-        "beats_per_bar": 4,
-        "first_downbeat": 0.75,
-        # Two beats and a handful of notes are far too little to measure a lag
-        # from, so the UI is told to shift its notes by nothing.
-        "onset_delay": 0.0,
-    }
+    assert (
+        _parse_sse(resp.text)[-1]["beat_grid"],
+        model._detect_beat_grid_prepared.call_args.args[1],
+    ) == (
+        {
+            "bpm": 123.5,
+            "beats_per_bar": 4,
+            "first_downbeat": 0.75,
+            # Two beats and a handful of notes are far too little to measure a lag
+            # from, so the UI is told to shift its notes by nothing.
+            "onset_delay": 0.0,
+        },
+        "best-effort",
+    )
 
 
 def test_transcribe_forwards_progress(tmp_path):
@@ -234,7 +320,7 @@ def test_transcribe_passes_tensor_not_path(tmp_path):
         files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
     )
     assert resp.status_code == 200
-    audio = model.transcribe.call_args.args[0]
+    audio = model._prepare_audio.call_args.args[0]
     assert isinstance(audio, tuple)
     tensor, sr = audio
     assert isinstance(tensor, torch.Tensor)
@@ -263,7 +349,7 @@ def test_transcribe_accepts_non_wav_audio():
         files={"file": ("clip.flac", _flac_bytes(sample_rate=22050), "audio/flac")},
     )
     assert resp.status_code == 200
-    audio = model.transcribe.call_args.args[0]
+    audio = model._prepare_audio.call_args.args[0]
     assert isinstance(audio, tuple)
     tensor, sr = audio
     assert isinstance(tensor, torch.Tensor)
@@ -291,7 +377,10 @@ def test_transcribe_passes_instruments(tmp_path):
         data={"instruments": ["violin", "drums"]},
     )
     assert resp.status_code == 200
-    assert model.transcribe.call_args.kwargs["instruments"] == ["violin", "drums"]
+    assert model._transcribe_prepared.call_args.kwargs["instruments"] == [
+        "violin",
+        "drums",
+    ]
 
 
 def test_transcribe_midi_returns_bytes_with_headers(tmp_path):
@@ -376,10 +465,7 @@ def test_transcribe_midi_rejects_audio_over_duration_limit(tmp_path, monkeypatch
 
 
 def _blocking_transcribe_model(first_reached: threading.Event, gate: threading.Event):
-    """A mock whose first `transcribe()` call streams one note, then blocks on
-    `gate` (signalling via `first_reached` once it's blocked) while still holding
-    the lock; later calls stream both notes without blocking. Lets a test force
-    two /transcribe requests to overlap deterministically."""
+    """最初のprepared採譜だけ途中で止め、2 requestを確実に競合させるmock。"""
     s0 = NoteStartEvent(pitch=60, start_time=0.0, index=0, instrument="piano")
     e0 = NoteEndEvent(end_time=0.5, start_event=s0)
     call_lock = threading.Lock()
@@ -396,9 +482,11 @@ def _blocking_transcribe_model(first_reached: threading.Event, gate: threading.E
         yield e0
 
     model = create_autospec(TranscriptionModel, instance=True)
-    model.transcribe.side_effect = side_effect
+    model._device = "cpu"
+    model._prepare_audio.side_effect = lambda audio: audio[0]
+    model._transcribe_prepared.side_effect = side_effect
     model.events_to_midi_bytes.return_value = FAKE_MIDI
-    model.detect_beat_grid_for.return_value = None
+    model._detect_beat_grid_prepared.return_value = None
     return model, s0
 
 
@@ -462,7 +550,7 @@ def test_concurrent_different_clients_do_not_preempt(tmp_path):
         headers={"X-Client-Id": "tab-B"},
     )
     assert _parse_sse(resp_b_retry.text)[-1]["type"] == "transcription_complete"
-    assert model.transcribe.call_count == 2
+    assert model._transcribe_prepared.call_count == 2
 
 
 def test_concurrent_same_client_preempts(tmp_path):
@@ -496,7 +584,7 @@ def test_concurrent_same_client_preempts(tmp_path):
     assert out["A"] == [event_to_dict(s0)]
     # B (the resubmit) ran to completion.
     assert out["B"][-1]["type"] == "transcription_complete"
-    assert model.transcribe.call_count == 2
+    assert model._transcribe_prepared.call_count == 2
 
 
 # ---- /sheets ------------------------------------------------------------
