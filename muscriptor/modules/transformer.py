@@ -1,6 +1,5 @@
 """Causal streaming transformer for muscriptor inference."""
 
-from einops import rearrange
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -80,7 +79,8 @@ class StreamingMultiheadAttention(StatefulModule):
     ):
         state = self.get_state(model_state)
         projected = nn.functional.linear(query, self.in_proj_weight)
-        packed = rearrange(projected, "b t (p h d) -> b t p h d", p=3, h=self.num_heads)
+        B, T, _ = projected.shape
+        packed = projected.reshape(B, T, 3, self.num_heads, self.dim_per_head)
         q, k, v = packed.unbind(dim=2)
 
         k, v = self._complete_kv(k, v, state)
@@ -114,7 +114,7 @@ class StreamingMultiheadAttention(StatefulModule):
             )
         x = x.transpose(1, 2).to(dtype)
 
-        x = rearrange(x, "b t h d -> b t (h d)")
+        x = x.reshape(B, T, self.embed_dim)
         x = self.out_proj(x)
         return x
 

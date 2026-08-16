@@ -1,7 +1,9 @@
 """Tests for muscriptor/modules/transformer.py — CPU only, small tensors."""
 
+import einops
 import torch
 
+from muscriptor.modules import transformer as transformer_module
 from muscriptor.modules.streaming import increment_steps, init_states
 from muscriptor.modules.transformer import (
     create_sin_embedding,
@@ -87,6 +89,22 @@ def test_attention_never_reads_the_unwritten_cache_tail():
     )
     assert torch.all(states[0][""]["cache"][:, :, 3:] == 123)
     assert torch.all(states[1][""]["cache"][:, :, 3:] == -456)
+
+
+def test_attention_forward_avoids_einops_in_the_decode_loop(monkeypatch):
+    attention = StreamingMultiheadAttention(embed_dim=8, num_heads=2).eval()
+    state = init_states(attention, batch_size=1, sequence_length=3)
+
+    def fail_rearrange(*_args, **_kwargs):
+        raise AssertionError("decode loopからeinopsを呼ばない")
+
+    monkeypatch.setattr(einops, "rearrange", fail_rearrange)
+    monkeypatch.setattr(transformer_module, "rearrange", fail_rearrange, raising=False)
+
+    with torch.no_grad():
+        output = attention(torch.randn(1, 1, 8), model_state=state)
+
+    assert output.shape == (1, 1, 8)
 
 
 # ---------------------------------------------------------------------------
