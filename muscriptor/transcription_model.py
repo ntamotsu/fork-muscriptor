@@ -549,6 +549,8 @@ class TranscriptionModel:
                 # open notes) so open_keys() is exactly the decoder's view.
                 tracker.feed(bnd)
                 if batch_start > 0:
+                    # 正規のtie prologueにはEOSが含まれないため、promptの
+                    # echo中にhost側のEOS停止が発火することはない。
                     prompt = torch.tensor(
                         [self._tokenizer.tie_section_token_ids(tracker.open_keys())],
                         device=self._device,
@@ -556,7 +558,7 @@ class TranscriptionModel:
                     )
             yield bnd
 
-            for step in self._model.generate(
+            steps = self._model.generate(
                 prompt=prompt,
                 conditions=batch_conditions,
                 max_gen_len=max_gen_len,
@@ -565,32 +567,41 @@ class TranscriptionModel:
                 top_k=0,
                 top_p=0.0,
                 cfg_coef=cfg_coef,
-                early_stop_on_token=eos_id,
+                early_stop_on_token=None if beam_size == 1 else eos_id,
                 beam_size=beam_size,
                 forbidden_tokens=forbidden_tokens,
                 profile=profile,
-            ):
-                row = step.tolist()  # one token per chunk: [n]
-                for j in range(n):
-                    if done[j]:
-                        continue
-                    tok = row[j]
-                    if tok == eos_id:
-                        done[j] = True
-                    else:
-                        if tracker is not None:
-                            tracker.feed(tok)
-                        if j == active:
-                            yield tok
+            )
+            try:
+                for step in steps:
+                    row = step.tolist()  # one token per chunk: [n]
+                    for j in range(n):
+                        if done[j]:
+                            continue
+                        tok = row[j]
+                        if tok == eos_id:
+                            done[j] = True
                         else:
-                            buffers[j].append(tok)
-                # When the live chunk finishes, flush and stream the next one(s).
-                while active < n and done[active]:
-                    active += 1
-                    if active < n:
-                        yield boundary(batch_start + active)
-                        yield from buffers[active]
-                        buffers[active] = []
+                            if tracker is not None:
+                                tracker.feed(tok)
+                            if j == active:
+                                yield tok
+                            else:
+                                buffers[j].append(tok)
+                    # When the live chunk finishes, flush and stream the next one(s).
+                    while active < n and done[active]:
+                        active += 1
+                        if active < n:
+                            yield boundary(batch_start + active)
+                            yield from buffers[active]
+                            buffers[active] = []
+                    # beam=1はtolist済みのhost状態で停止し、LM側のdevice scanを省く。
+                    if beam_size == 1 and active == n:
+                        break
+            finally:
+                close = getattr(steps, "close", None)
+                if callable(close):
+                    close()
 
             # Any chunk still open never emitted EOS within max_gen_len.
             for j in range(active, n):

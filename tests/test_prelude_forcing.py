@@ -82,6 +82,15 @@ def test_tie_section_empty_is_just_the_tie_token(tokenizer):
     assert tokenizer.tie_section_token_ids([]) == [_tok("tie")]
 
 
+def test_tie_section_never_contains_eos(tokenizer):
+    prompts = [
+        tokenizer.tie_section_token_ids([]),
+        tokenizer.tie_section_token_ids([(0, 60), (32, 70)]),
+    ]
+
+    assert all(tokenizer.eos_id not in prompt for prompt in prompts)
+
+
 def test_tie_section_sorts_and_dedupes_programs(tokenizer):
     got = tokenizer.tie_section_token_ids([(5, 62), (5, 60), (2, 40)])
     assert got == [

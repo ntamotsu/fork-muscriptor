@@ -25,7 +25,16 @@ from muscriptor.utils.beats import BeatDetectionError, _LazyAudio2Beats
 EOS = 99
 
 
-def _run(batches, *, batch_size, seek_times, no_eos_is_ok=False):
+def _run(
+    batches,
+    *,
+    batch_size,
+    seek_times,
+    no_eos_is_ok=False,
+    beam_size=1,
+    generate_calls=None,
+    closed_calls=None,
+):
     """Drive _generate_token_stream with a fake model.
 
     ``batches`` is one list of rows per expected ``generate()`` call; each row
@@ -37,9 +46,15 @@ def _run(batches, *, batch_size, seek_times, no_eos_is_ok=False):
     calls = iter(batches)
 
     def generate(**kwargs):
-        for row in next(calls):
-            pulled.append(row)
-            yield torch.tensor(row)
+        try:
+            if generate_calls is not None:
+                generate_calls.append(kwargs)
+            for row in next(calls):
+                pulled.append(row)
+                yield torch.tensor(row)
+        finally:
+            if closed_calls is not None:
+                closed_calls.append(True)
 
     fake = SimpleNamespace(
         _model=SimpleNamespace(generate=generate),
@@ -59,8 +74,29 @@ def _run(batches, *, batch_size, seek_times, no_eos_is_ok=False):
         # The fake tokenizer has no vocab; prelude forcing has its own tests
         # (test_prelude_forcing.py).
         prelude_forcing=False,
+        beam_size=beam_size,
     )
     return stream, pulled
+
+
+def _stream_from_steps(steps):
+    """既成のstep iteratorをfake model経由でtoken streamへ接続する。"""
+    fake = SimpleNamespace(
+        _model=SimpleNamespace(generate=lambda **_kwargs: steps),
+        _tokenizer=SimpleNamespace(eos_id=EOS),
+    )
+    return TranscriptionModel._generate_token_stream(
+        fake,
+        [object()],
+        [0.0],
+        batch_size=1,
+        max_gen_len=64,
+        use_sampling=False,
+        temperature=1.0,
+        cfg_coef=2.0,
+        no_eos_is_ok=False,
+        prelude_forcing=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +130,138 @@ def test_single_chunk_streams_token_by_token():
     for expected, count in [(10, 1), (11, 2), (12, 3)]:
         assert next(it) == expected
         assert len(pulled) == count
+
+
+def test_single_beam_delegates_eos_stop_to_the_host():
+    generate_calls = []
+    stream, _ = _run(
+        [[[10], [EOS]]],
+        batch_size=1,
+        seek_times=[0.0],
+        generate_calls=generate_calls,
+    )
+
+    list(stream)
+
+    assert [call["early_stop_on_token"] for call in generate_calls] == [None]
+
+
+def test_single_beam_stops_and_closes_after_staggered_eos():
+    rows = [[10, 20], [11, EOS], [12, 777], [EOS, 888], [889, 890]]
+    closed_calls = []
+    stream, pulled = _run(
+        [rows],
+        batch_size=2,
+        seek_times=[0.0, 5.0],
+        closed_calls=closed_calls,
+    )
+
+    events = list(stream)
+
+    assert (events, pulled, closed_calls) == (
+        [
+            ChunkBoundary(0.0, 5.0),
+            10,
+            11,
+            12,
+            ChunkBoundary(5.0, None),
+            20,
+            ProgressEvent(completed=2, total=2),
+        ],
+        rows[:4],
+        [True],
+    )
+
+
+def test_closing_token_stream_closes_active_model_steps():
+    class ClosableSteps:
+        def __init__(self):
+            self.rows = iter([torch.tensor([10]), torch.tensor([EOS])])
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.rows)
+
+        def close(self):
+            self.closed = True
+
+    steps = ClosableSteps()
+    stream = _stream_from_steps(steps)
+
+    assert next(stream) == ChunkBoundary(0.0, None)
+    assert next(stream) == 10
+    stream.close()
+
+    assert steps.closed is True
+
+
+def test_model_step_error_is_propagated_and_iterator_is_closed():
+    class FailingSteps:
+        def __init__(self):
+            self.calls = 0
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.calls += 1
+            if self.calls == 1:
+                return torch.tensor([10])
+            raise RuntimeError("fake generation failure")
+
+        def close(self):
+            self.closed = True
+
+    steps = FailingSteps()
+    stream = _stream_from_steps(steps)
+
+    assert next(stream) == ChunkBoundary(0.0, None)
+    assert next(stream) == 10
+    with pytest.raises(RuntimeError, match="fake generation failure"):
+        next(stream)
+
+    assert steps.closed is True
+
+
+def test_token_stream_accepts_model_steps_without_close():
+    steps = iter([torch.tensor([EOS])])
+
+    assert list(_stream_from_steps(steps)) == [
+        ChunkBoundary(0.0, None),
+        ProgressEvent(completed=1, total=1),
+    ]
+
+
+def test_beam_search_keeps_eos_stopping_inside_the_model():
+    rows = [[10], [EOS], [777]]
+    generate_calls = []
+    stream, pulled = _run(
+        [rows],
+        batch_size=1,
+        seek_times=[0.0],
+        beam_size=2,
+        generate_calls=generate_calls,
+    )
+
+    events = list(stream)
+
+    assert (
+        events,
+        pulled,
+        [call["early_stop_on_token"] for call in generate_calls],
+    ) == (
+        [
+            ChunkBoundary(0.0, None),
+            10,
+            ProgressEvent(completed=1, total=1),
+        ],
+        rows,
+        [EOS],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +324,16 @@ def test_chunks_across_multiple_batches_stay_in_order():
 
 def test_missing_eos_raises_by_default():
     rows = [[10, 20], [11, 21]]  # neither chunk emits EOS
-    stream, _ = _run([rows], batch_size=2, seek_times=[0.0, 5.0])
+    closed_calls = []
+    stream, _ = _run(
+        [rows],
+        batch_size=2,
+        seek_times=[0.0, 5.0],
+        closed_calls=closed_calls,
+    )
     with pytest.raises(RuntimeError, match="did not emit EOS"):
         list(stream)
+    assert closed_calls == [True]
 
 
 def test_missing_eos_warns_and_still_emits_when_allowed():
