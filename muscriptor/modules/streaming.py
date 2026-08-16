@@ -37,6 +37,9 @@ class StatefulModule(ABC, nn.Module):
         return model_state.get(self._module_absolute_name)
 
 
+_IncrementPlan = tuple[tuple[StatefulModule, str], ...]
+
+
 def init_states(model: nn.Module, batch_size: int, sequence_length: int) -> ModelState:
     """Allocate state for every :class:`StatefulModule` reachable from ``model``.
 
@@ -66,3 +69,23 @@ def increment_steps(
             and module._module_absolute_name is not None
         ):
             module.increment_step(model_state[module._module_absolute_name], increment)
+
+
+def _prepare_increment_plan(model: nn.Module) -> _IncrementPlan:
+    """同じstate初期化後の固定module treeで再利用する一覧を構築する。"""
+    targets = []
+    for _, module in model.named_modules():
+        if not isinstance(module, StatefulModule):
+            continue
+        absolute_name = module._module_absolute_name
+        if absolute_name is not None:
+            targets.append((module, absolute_name))
+    return tuple(targets)
+
+
+def _increment_steps_from_plan(
+    plan: _IncrementPlan, model_state: ModelState, increment: int = 1
+) -> None:
+    """事前構築した一覧を使い、module treeの再走査なしでstepを進める。"""
+    for module, absolute_name in plan:
+        module.increment_step(model_state[absolute_name], increment)

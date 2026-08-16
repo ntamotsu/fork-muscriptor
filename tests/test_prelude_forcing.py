@@ -21,6 +21,7 @@ import pytest
 import torch
 
 import muscriptor.accelerator
+import muscriptor.models.lm as lm_module
 from muscriptor.events import (
     ChunkBoundary,
     NoteEndEvent,
@@ -31,6 +32,7 @@ from muscriptor.events import (
 )
 from muscriptor.models.lm import LMModel
 from muscriptor.modules.conditioners import ConditioningAttributes, ConditioningProvider
+from muscriptor.modules.streaming import increment_steps
 from muscriptor.tokenizer.mt3 import MT3Tokenizer
 from muscriptor.tokenizer.notes import NoteEvent, TieNoteEvent, build_event_vocab
 from muscriptor.transcription_model import TranscriptionModel
@@ -424,6 +426,89 @@ def test_generate_is_silent_and_does_not_synchronize_by_default(
     captured = capsys.readouterr()
 
     assert (synchronize_calls, captured.out, captured.err) == ([], "", "")
+
+
+def test_generate_walks_transformer_modules_only_during_setup(tiny_model, monkeypatch):
+    walks = 0
+    original_named_modules = tiny_model.transformer.named_modules
+
+    def count_walks(*args, **kwargs):
+        nonlocal walks
+        walks += 1
+        return original_named_modules(*args, **kwargs)
+
+    monkeypatch.setattr(tiny_model.transformer, "named_modules", count_walks)
+
+    list(tiny_model.generate(max_gen_len=4, use_sampling=False))
+
+    # full modelのstate初期化とgeneration-local plan構築で1回ずつ走査する。
+    # decode stepでは構築済みplanを再利用する。
+    assert walks == 2
+
+
+@pytest.mark.parametrize(
+    "generation_options",
+    [
+        {"use_sampling": False},
+        {"use_sampling": False, "cfg_coef": 2.0},
+        {"use_sampling": False, "beam_size": 2, "early_stop_on_token": 7},
+    ],
+)
+def test_prepared_increment_plan_matches_dynamic_generation(
+    tiny_model, monkeypatch, generation_options
+):
+    prepared_tokens = _tokens(
+        tiny_model.generate(max_gen_len=8, num_samples=1, **generation_options)
+    )
+
+    def use_dynamic_increment(plan, model_state, increment=1):
+        del plan
+        increment_steps(tiny_model.transformer, model_state, increment)
+
+    monkeypatch.setattr(lm_module, "_increment_steps_from_plan", use_dynamic_increment)
+    dynamic_tokens = _tokens(
+        tiny_model.generate(max_gen_len=8, num_samples=1, **generation_options)
+    )
+
+    assert prepared_tokens == dynamic_tokens
+
+
+def test_prepared_increment_plan_preserves_sampling_tokens_and_rng(
+    tiny_model, monkeypatch
+):
+    torch.manual_seed(1234)
+    prepared_tokens = _tokens(
+        tiny_model.generate(
+            max_gen_len=8,
+            num_samples=1,
+            use_sampling=True,
+            temp=1.3,
+            top_k=5,
+        )
+    )
+    prepared_rng = torch.get_rng_state()
+
+    def use_dynamic_increment(plan, model_state, increment=1):
+        del plan
+        increment_steps(tiny_model.transformer, model_state, increment)
+
+    monkeypatch.setattr(lm_module, "_increment_steps_from_plan", use_dynamic_increment)
+    torch.manual_seed(1234)
+    dynamic_tokens = _tokens(
+        tiny_model.generate(
+            max_gen_len=8,
+            num_samples=1,
+            use_sampling=True,
+            temp=1.3,
+            top_k=5,
+        )
+    )
+    dynamic_rng = torch.get_rng_state()
+
+    assert (prepared_tokens, prepared_rng.tolist()) == (
+        dynamic_tokens,
+        dynamic_rng.tolist(),
+    )
 
 
 def test_generate_profile_writes_condition_timing_only_to_stderr(

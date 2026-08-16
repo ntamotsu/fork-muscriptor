@@ -19,7 +19,8 @@ from muscriptor.profiling import message as profile_message
 from muscriptor.profiling import timed as profile_timed
 from muscriptor.modules.streaming import (
     ModelState,
-    increment_steps,
+    _increment_steps_from_plan,
+    _prepare_increment_plan,
     init_states,
 )
 from muscriptor.modules.transformer import StreamingTransformer
@@ -385,6 +386,7 @@ class LMModel(nn.Module):
         model_state = init_states(
             self, batch_size=cache_batch_size, sequence_length=cache_seq_len
         )
+        increment_plan = _prepare_increment_plan(self.transformer)
 
         # Accumulated log-prob scores, one per beam row.
         beam_scores = torch.zeros(eff_batch, device=device, dtype=torch.float)
@@ -426,8 +428,8 @@ class LMModel(nn.Module):
                     )  # [B]
 
                     input_T = input_.shape[-1]
-                    increment_steps(
-                        self.transformer,
+                    _increment_steps_from_plan(
+                        increment_plan,
                         model_state,
                         increment=input_T + (prepend_length if first_iter else 0),
                     )
@@ -451,8 +453,8 @@ class LMModel(nn.Module):
                         forbidden_tokens=forbidden_tokens,
                     )  # [eff_batch, card]
                     input_T = input_.shape[-1]
-                    increment_steps(
-                        self.transformer,
+                    _increment_steps_from_plan(
+                        increment_plan,
                         model_state,
                         increment=input_T + (prepend_length if first_iter else 0),
                     )
