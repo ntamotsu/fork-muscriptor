@@ -197,6 +197,19 @@ def transcribe(
             help="Measure inference phases with accelerator synchronization and write timings to stderr.",
         ),
     ] = False,
+    speculative_decoding: Annotated[
+        bool,
+        typer.Option(
+            "--speculative-decoding",
+            help=(
+                "Experimentally accelerate output-preserving greedy decoding "
+                "with verified history n-grams. Some audio may be slower when "
+                "drafts often miss, so benchmark representative material first. "
+                "Currently requires the large float16 model on MPS, batch size "
+                "1, CFG 1, prelude forcing, and profiling disabled."
+            ),
+        ),
+    ] = False,
     auralize: Annotated[
         Path | None,
         typer.Option(
@@ -260,6 +273,34 @@ def transcribe(
             raise typer.Exit(1)
         typer.echo(f"Instruments: {', '.join(instrument_names)}", err=True)
 
+    if speculative_decoding:
+        incompatible = []
+        if sampling:
+            incompatible.append("greedy decoding (omit --sampling)")
+        if cfg_coef != 1.0:
+            incompatible.append("--cfg-coef 1")
+        if batch_size not in (None, 1):
+            incompatible.append("--batch-size 1")
+        if beam_size != 1:
+            incompatible.append("--beam-size 1")
+        if not prelude_forcing:
+            incompatible.append("--prelude-forcing")
+        if profile:
+            incompatible.append("profiling disabled")
+        if model_path is None or model_path.casefold() in {"small", "medium"}:
+            incompatible.append("--model large")
+        if device != "auto" and not device.startswith("mps"):
+            incompatible.append("--device mps (or auto on Apple Silicon)")
+        if dtype is not None and dtype.casefold() != "float16":
+            incompatible.append("--dtype float16")
+        if incompatible:
+            typer.echo(
+                "Error: --speculative-decoding currently requires "
+                + ", ".join(incompatible),
+                err=True,
+            )
+            raise typer.Exit(1)
+
     if not audio_file.exists():
         typer.echo(f"Error: file not found: {audio_file}", err=True)
         raise typer.Exit(1)
@@ -310,6 +351,22 @@ def transcribe(
     typer.echo("Loading model…", err=True)
     model = _load_model(model_path, _device, dtype)
 
+    if speculative_decoding:
+        validator = getattr(model, "_validate_speculative_request", None)
+        if callable(validator):
+            try:
+                validator(
+                    use_sampling=False,
+                    cfg_coef=1.0,
+                    batch_size=1,
+                    beam_size=1,
+                    prelude_forcing=True,
+                    profile=False,
+                )
+            except ValueError as e:
+                typer.echo(f"Error: {e}", err=True)
+                raise typer.Exit(1)
+
     typer.echo(f"Transcribing {audio_file} …", err=True)
 
     if auralize is not None and format != OutputFormat.midi:
@@ -328,6 +385,8 @@ def transcribe(
         prelude_forcing=prelude_forcing,
         profile=profile,
     )
+    if speculative_decoding:
+        kwargs["speculative_decoding"] = True
 
     if format == OutputFormat.sheets:
         midi_bytes = _transcribe_to_midi(model, kwargs, detect_tempo)

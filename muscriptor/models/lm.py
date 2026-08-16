@@ -375,7 +375,7 @@ class LMModel(nn.Module):
             )
 
         cfg_coef = self.cfg_coef if cfg_coef is None else cfg_coef
-        if _draft_provider is not None and not self._can_use_speculative_greedy():
+        if _draft_provider is not None and not _supports_speculative_greedy(self):
             _draft_provider = None
             _speculative_stop_token = None
         if _draft_provider is not None and (
@@ -704,10 +704,23 @@ class LMModel(nn.Module):
 
 # class-level monkeypatchも検出できるよう、module import時のdescriptorを保持する。
 _SPECULATIVE_LM_METHODS = {
+    "generate": LMModel.generate,
     "forward": LMModel.forward,
     "_compute_logits": LMModel._compute_logits,
+    "_compute_speculative_logits": LMModel._compute_speculative_logits,
     "_sample_next_token": LMModel._sample_next_token,
 }
+_SPECULATIVE_GUARD_METHOD = LMModel._can_use_speculative_greedy
 _SPECULATIVE_TRANSFORMER_FORWARD = StreamingTransformer.forward
 _SPECULATIVE_LAYER_FORWARD = StreamingTransformerLayer.forward
 _SPECULATIVE_ATTENTION_FORWARD = StreamingMultiheadAttention.forward
+
+
+def _supports_speculative_greedy(model: LMModel) -> bool:
+    """guard自身の差し替えを含め、block検証seamが標準実装か確認する。"""
+    guard = getattr(model, "_can_use_speculative_greedy")
+    return (
+        getattr(guard, "__self__", None) is model
+        and getattr(guard, "__func__", None) is _SPECULATIVE_GUARD_METHOD
+        and _SPECULATIVE_GUARD_METHOD(model)
+    )

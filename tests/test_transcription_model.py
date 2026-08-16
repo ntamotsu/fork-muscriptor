@@ -671,16 +671,22 @@ class _MinimalTranscriber(TranscriptionModel):
         )
         self.profile_seen = None
         self.generation_observer_seen = None
+        self.speculative_seen = None
+
+    def _validate_speculative_ngram(self, *, profile):
+        del profile
 
     def _generate_token_stream(
         self,
         *_args,
         profile=False,
         _generation_observer=None,
+        _speculative_ngram=False,
         **_kwargs,
     ):
         self.profile_seen = profile
         self.generation_observer_seen = _generation_observer
+        self.speculative_seen = _speculative_ngram
         return iter(())
 
 
@@ -690,13 +696,15 @@ class _PreparedAudioRecorder(_MinimalTranscriber):
         self.load_calls = 0
         self.prepared = torch.ones(1, 100)
         self.transcription_wavs = []
+        self.transcription_kwargs = []
 
     def _load_wav(self, _audio, _sample_rate):
         self.load_calls += 1
         return self.prepared
 
-    def _transcribe_prepared(self, wav, **_kwargs):
+    def _transcribe_prepared(self, wav, **kwargs):
         self.transcription_wavs.append(wav)
+        self.transcription_kwargs.append(kwargs)
         yield ProgressEvent(completed=0, total=0)
 
     @staticmethod
@@ -768,6 +776,7 @@ def test_transcribe_remains_lazy_when_using_a_prepared_audio_path():
     assert list(events) == [ProgressEvent(completed=0, total=0)]
     assert model.load_calls == 1
     assert model.transcription_wavs == [model.prepared]
+    assert "_speculative_ngram" not in model.transcription_kwargs[-1]
 
 
 def test_midi_prepares_audio_once_and_shares_the_same_tensor(monkeypatch):
@@ -790,6 +799,7 @@ def test_midi_prepares_audio_once_and_shares_the_same_tensor(monkeypatch):
     assert model.load_calls == 1
     assert beat_wavs == [model.prepared]
     assert model.transcription_wavs == [model.prepared]
+    assert "_speculative_ngram" not in model.transcription_kwargs[-1]
 
 
 def test_inherited_midi_dispatches_to_public_overrides_without_private_state():
@@ -883,6 +893,116 @@ def test_transcribe_forwards_profile_to_token_generation(monkeypatch):
     list(model.transcribe((torch.zeros(1, 100), 16_000), profile=True))
 
     assert model.profile_seen is True
+
+
+def test_transcribe_forwards_speculative_decoding_only_when_enabled():
+    model = _MinimalTranscriber()
+
+    list(
+        model.transcribe(
+            (torch.zeros(1, 100), 16_000),
+            speculative_decoding=True,
+            log_progress=False,
+        )
+    )
+
+    assert model.speculative_seen is True
+
+
+def test_speculative_decoding_is_public_keyword_only():
+    parameter = inspect.signature(TranscriptionModel.transcribe).parameters[
+        "speculative_decoding"
+    ]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+
+    midi_parameter = inspect.signature(
+        TranscriptionModel.transcribe_to_midi
+    ).parameters["speculative_decoding"]
+    assert midi_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert midi_parameter.default is False
+
+
+def test_speculative_decoding_rejects_unverified_mode_before_audio_preparation():
+    model = _PreparedAudioRecorder()
+
+    with pytest.raises(ValueError, match="prelude forcing"):
+        list(
+            model.transcribe(
+                (torch.zeros(1, 100), 16_000),
+                speculative_decoding=True,
+                prelude_forcing=False,
+                batch_size=1,
+                log_progress=False,
+            )
+        )
+
+    assert model.load_calls == 0
+
+
+def test_midi_fast_path_forwards_speculative_decoding_privately(monkeypatch):
+    model = _PreparedAudioRecorder()
+    monkeypatch.setattr(
+        "muscriptor.transcription_model.detect_grid",
+        lambda *_args, **_kwargs: "beat-grid",
+    )
+
+    model.transcribe_to_midi(
+        (torch.zeros(1, 16_000), 16_000),
+        speculative_decoding=True,
+        detect_tempo=True,
+        log_progress=False,
+    )
+
+    assert model.transcription_kwargs[-1]["_speculative_ngram"] is True
+
+
+def test_midi_speculative_validation_runs_before_audio_preparation():
+    model = _PreparedAudioRecorder()
+
+    with pytest.raises(ValueError, match="prelude forcing"):
+        model.transcribe_to_midi(
+            (torch.zeros(1, 16_000), 16_000),
+            speculative_decoding=True,
+            prelude_forcing=False,
+            batch_size=1,
+            detect_tempo=False,
+        )
+
+    assert model.load_calls == 0
+
+
+def test_midi_public_override_receives_speculative_decoding_only_when_enabled():
+    calls = []
+
+    class PublicOnlyTranscriber(TranscriptionModel):
+        def __init__(self):
+            pass
+
+        def detect_beat_grid_for(self, _audio, _mode="best-effort"):
+            return None
+
+        def transcribe(self, _audio, **kwargs):
+            calls.append(kwargs)
+            return iter(())
+
+        @staticmethod
+        def events_to_midi_bytes(events, beat_grid=None):
+            list(events)
+            assert beat_grid is None
+            return b"MIDI"
+
+    model = PublicOnlyTranscriber()
+    model.transcribe_to_midi("audio.wav", detect_tempo=False)
+    model.transcribe_to_midi(
+        "audio.wav",
+        detect_tempo=False,
+        speculative_decoding=True,
+    )
+
+    assert "speculative_decoding" not in calls[0]
+    assert calls[1]["speculative_decoding"] is True
 
 
 def test_private_prepared_path_forwards_generation_observer():

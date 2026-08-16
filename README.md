@@ -76,6 +76,27 @@ uvx muscriptor transcribe path/to/audio_file.wav
 
 See `--help` for all the options.
 
+### Experimental speculative decoding on Apple Silicon
+
+The large float16 model can opt into output-preserving history n-gram
+speculative decoding on MPS. Short token sequences predicted from earlier
+chunks are accepted only after the same large model verifies them, so a wrong
+prediction costs time but is not emitted as transcription output.
+
+```bash
+muscriptor transcribe audio.wav \
+  --model large --device mps --dtype float16 \
+  --instruments drums,chromatic_percussion,orchestra_hit \
+  --speculative-decoding
+```
+
+This path is experimental and off by default. It currently requires greedy
+decoding, batch size 1, CFG 1, prelude forcing, and profiling disabled; the CLI
+reports unsupported combinations instead of silently falling back.
+The same-model verification preserves output, not speed: material whose history
+produces few accepted drafts can be slower. Benchmark representative audio before
+enabling it in a workflow.
+
 ### Sheet music
 
 Using the CLI with `--format sheets` engraves the transcription as readable notation instead of

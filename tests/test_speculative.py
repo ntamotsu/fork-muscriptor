@@ -5,6 +5,8 @@ import pytest
 import torch
 from torch.nn.modules.module import register_module_forward_hook
 
+import muscriptor.models.lm as lm_module
+import muscriptor.transcription_model as transcription_module
 from muscriptor.models.lm import LMModel
 from muscriptor.models.speculative import HistoryNgramDraft
 from muscriptor.modules.conditioners import ConditioningProvider
@@ -348,6 +350,37 @@ def test_speculative_greedy_detects_a_class_level_sampling_override(monkeypatch)
     assert calls == 0
 
 
+def test_speculative_guard_detects_an_overridden_block_verifier():
+    model = _tiny_lm()
+    original = model._compute_speculative_logits
+
+    def wrapped(self, *args, **kwargs):
+        return original(*args, **kwargs)
+
+    model._compute_speculative_logits = types.MethodType(wrapped, model)
+
+    assert model._can_use_speculative_greedy() is False
+
+
+def test_speculative_guard_method_cannot_be_monkeypatched_to_bypass_checks():
+    model = _tiny_lm()
+    model._can_use_speculative_greedy = lambda: True
+
+    assert lm_module._supports_speculative_greedy(model) is False
+
+
+def test_speculative_guard_detects_an_overridden_generate_method():
+    model = _tiny_lm()
+    original = model.generate
+
+    def wrapped(self, *args, **kwargs):
+        return original(*args, **kwargs)
+
+    model.generate = types.MethodType(wrapped, model)
+
+    assert lm_module._supports_speculative_greedy(model) is False
+
+
 def test_speculative_greedy_falls_back_for_a_patched_attention(monkeypatch):
     model = _tiny_lm()
     calls = 0
@@ -465,6 +498,36 @@ def test_fixed_workload_guard_rejects_unverified_devices():
 
     with pytest.raises(ValueError, match="MPS"):
         TranscriptionModel._validate_speculative_ngram(fake, profile=False)
+
+
+def test_fixed_workload_guard_checks_the_loaded_weight_device(monkeypatch):
+    model = transcription_module._build_model(
+        torch.device("meta"), transcription_module._CONFIGS["large"]
+    ).half()
+    model.eval()
+    monkeypatch.setattr(
+        "muscriptor.transcription_model._supports_speculative_greedy",
+        lambda _model: True,
+    )
+    fake = SimpleNamespace(
+        _device=torch.device("mps"),
+        _model=model,
+    )
+
+    with pytest.raises(ValueError, match="MPS"):
+        TranscriptionModel._validate_speculative_ngram(fake, profile=False)
+
+
+def test_verified_speculative_architecture_rejects_a_non_large_head_layout():
+    model = transcription_module._build_model(
+        torch.device("meta"), transcription_module._CONFIGS["large"]
+    )
+
+    assert TranscriptionModel._has_verified_speculative_architecture(model)
+
+    model.transformer.layers[0].self_attn.num_heads = 16
+
+    assert not TranscriptionModel._has_verified_speculative_architecture(model)
 
 
 def test_token_stream_drafts_from_a_completed_chunk_history():

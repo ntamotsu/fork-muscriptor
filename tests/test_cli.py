@@ -27,6 +27,7 @@ class _FakeInner:
 class _FakeModel:
     # kwargs of the most recent transcribe() call (reset by `patched_model`).
     last_kwargs: dict | None = None
+    speculative_validation_kwargs: dict | None = None
 
     def __init__(self):
         self._model = _FakeInner()
@@ -47,6 +48,9 @@ class _FakeModel:
     def transcribe_to_midi(self, **kwargs):
         type(self).last_kwargs = kwargs
         return b"FAKE_MIDI"
+
+    def _validate_speculative_request(self, **kwargs):
+        type(self).speculative_validation_kwargs = kwargs
 
 
 class _RealMidiMethodModel(_FakeModel):
@@ -89,6 +93,7 @@ def fake_audio(tmp_path: Path) -> Path:
 @pytest.fixture
 def patched_model(monkeypatch):
     _FakeModel.last_kwargs = None
+    _FakeModel.speculative_validation_kwargs = None
     monkeypatch.setattr(main_mod, "TranscriptionModel", _FakeModel)
 
 
@@ -154,6 +159,106 @@ def test_profile_flag_is_forwarded_to_transcription(patched_model, fake_audio):
 
     assert result.exit_code == 0, result.output
     assert _FakeModel.last_kwargs["profile"] is True
+
+
+def test_speculative_decoding_flag_is_forwarded_only_when_enabled(
+    patched_model, fake_audio
+):
+    runner = CliRunner()
+    enabled = runner.invoke(
+        main_mod.app,
+        [
+            "transcribe",
+            str(fake_audio),
+            "--model",
+            "large",
+            "--speculative-decoding",
+            "-f",
+            "jsonl",
+            "-o",
+            "-",
+        ],
+    )
+
+    assert enabled.exit_code == 0, enabled.output
+    assert _FakeModel.last_kwargs["speculative_decoding"] is True
+    assert _FakeModel.speculative_validation_kwargs == {
+        "use_sampling": False,
+        "cfg_coef": 1.0,
+        "batch_size": 1,
+        "beam_size": 1,
+        "prelude_forcing": True,
+        "profile": False,
+    }
+
+    disabled = runner.invoke(
+        main_mod.app,
+        ["transcribe", str(fake_audio), "-f", "jsonl", "-o", "-"],
+    )
+
+    assert disabled.exit_code == 0, disabled.output
+    assert "speculative_decoding" not in _FakeModel.last_kwargs
+
+
+def test_speculative_decoding_help_warns_that_some_audio_can_be_slower():
+    result = CliRunner().invoke(main_mod.app, ["transcribe", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "slower when" in " ".join(result.output.split())
+
+
+def test_speculative_decoding_reports_loaded_model_rejection_before_output_open(
+    monkeypatch, fake_audio, tmp_path
+):
+    class RejectingModel(_FakeModel):
+        def _validate_speculative_request(self, **_kwargs):
+            raise ValueError("requires the large float16 model on MPS")
+
+    monkeypatch.setattr(main_mod, "TranscriptionModel", RejectingModel)
+    output = tmp_path / "events.jsonl"
+    result = CliRunner().invoke(
+        main_mod.app,
+        [
+            "transcribe",
+            str(fake_audio),
+            "--model",
+            "large",
+            "--speculative-decoding",
+            "-f",
+            "jsonl",
+            "-o",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "large float16 model on MPS" in result.stderr
+    assert not output.exists()
+
+
+def test_speculative_decoding_rejects_incompatible_cli_mode_before_model_load(
+    patched_model, fake_audio
+):
+    result = CliRunner().invoke(
+        main_mod.app,
+        [
+            "transcribe",
+            str(fake_audio),
+            "--model",
+            "large",
+            "--speculative-decoding",
+            "--sampling",
+            "-f",
+            "jsonl",
+            "-o",
+            "-",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "greedy" in result.stderr
+    assert "Loading model" not in result.stderr
+    assert _FakeModel.last_kwargs is None
 
 
 def test_profile_flag_works_with_the_real_midi_method(

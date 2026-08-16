@@ -24,7 +24,7 @@ from muscriptor.events import (
     decode_model_tokens,
 )
 from muscriptor.generation_telemetry import ChunkGenerationStats
-from muscriptor.models.lm import LMModel, TorchAutocast
+from muscriptor.models.lm import LMModel, TorchAutocast, _supports_speculative_greedy
 from muscriptor.models.speculative import HistoryNgramDraft
 from muscriptor.modules.conditioners import (
     ClassConditioner,
@@ -334,6 +334,8 @@ class TranscriptionModel:
         prelude_forcing: bool = True,
         profile: bool = False,
         log_progress: bool = True,
+        *,
+        speculative_decoding: bool = False,
     ) -> Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent]:
         """Transcribe audio into a stream of note events.
 
@@ -357,6 +359,13 @@ class TranscriptionModel:
         ``prelude_forcing=False`` explicitly to trade chunk-boundary quality
         for batched throughput.
 
+        ``speculative_decoding`` is an experimental, opt-in acceleration for
+        the large float16 model on MPS. It predicts short token blocks from
+        prior chunks, then verifies them with the same model before yielding
+        anything; rejected predictions therefore do not change the decoded
+        event stream. The currently verified path requires greedy decoding,
+        batch size 1, CFG 1, prelude forcing, and profiling disabled.
+
         The event times may all carry the same small lag (up to ~25 ms) due to model
         bias. Taking it out needs the beat grid and every onset in the transcription,
         which only exist once the stream has finished, so prefer
@@ -367,10 +376,18 @@ class TranscriptionModel:
         ``completed == 0``, then one as each chunk finishes. Consumers that
         only care about notes can ignore them.
         """
+        if speculative_decoding:
+            self._validate_speculative_request(
+                use_sampling=use_sampling,
+                cfg_coef=cfg_coef,
+                batch_size=self._resolve_batch_size(batch_size, prelude_forcing),
+                beam_size=beam_size,
+                prelude_forcing=prelude_forcing,
+                profile=profile,
+            )
         with profile_timed(profile, "load audio", device=self._device):
             wav = self._prepare_audio(audio)
-        yield from self._transcribe_prepared(
-            wav,
+        options = dict(
             use_sampling=use_sampling,
             temperature=temperature,
             cfg_coef=cfg_coef,
@@ -382,6 +399,9 @@ class TranscriptionModel:
             profile=profile,
             log_progress=log_progress,
         )
+        if speculative_decoding:
+            options["_speculative_ngram"] = True
+        yield from self._transcribe_prepared(wav, **options)
 
     def _transcribe_prepared(
         self,
@@ -403,7 +423,14 @@ class TranscriptionModel:
         """canonicalize済みの音声から採譜eventを生成する。"""
         batch_size = self._resolve_batch_size(batch_size, prelude_forcing)
         if _speculative_ngram:
-            self._validate_speculative_ngram(profile=profile)
+            self._validate_speculative_request(
+                use_sampling=use_sampling,
+                cfg_coef=cfg_coef,
+                batch_size=batch_size,
+                beam_size=beam_size,
+                prelude_forcing=prelude_forcing,
+                profile=profile,
+            )
 
         # Exact names only here — the CLI resolves abbreviations before
         # calling in (resolve_instrument_names).
@@ -516,18 +543,85 @@ class TranscriptionModel:
         model = self._model
         supported = (
             self._device.type == "mps"
-            and type(model) is LMModel
-            and model.emb.weight.dtype == torch.float16
-            and model.dim == 1536
-            and len(model.transformer.layers) == 48
-            and not profile
-            and model._can_use_speculative_greedy()
+            and TranscriptionModel._has_verified_speculative_architecture(model)
         )
+        if supported:
+            inference_modules = (
+                model.emb,
+                model.transformer,
+                model.out_norm,
+                model.linear,
+            )
+            supported = (
+                not model.training
+                and all(
+                    parameter.device.type == "mps" and parameter.dtype == torch.float16
+                    for module in inference_modules
+                    for parameter in module.parameters()
+                )
+                and not profile
+                and _supports_speculative_greedy(model)
+            )
         if not supported:
             raise ValueError(
                 "n-gram speculative decoding is currently verified only for "
                 "the large float16 model on MPS without profiling or hooks"
             )
+
+    @staticmethod
+    def _has_verified_speculative_architecture(model: object) -> bool:
+        """published large modelと同じdecode構造かを確認する。"""
+        if type(model) is not LMModel:
+            return False
+        config = _CONFIGS["large"]
+        feedforward_dim = 4 * config.dim
+        if (
+            model.dim != config.dim
+            or model.card != config.card
+            or model.emb.num_embeddings != config.card + 1
+            or model.emb.embedding_dim != config.dim
+            or len(model.transformer.layers) != config.num_layers
+            or model.transformer.max_period != 10_000
+            or model.out_norm.normalized_shape != (config.dim,)
+            or model.linear.in_features != config.dim
+            or model.linear.out_features != config.card
+        ):
+            return False
+        return all(
+            layer.self_attn.embed_dim == config.dim
+            and layer.self_attn.num_heads == config.num_heads
+            and layer.self_attn.dim_per_head == config.dim // config.num_heads
+            and layer.linear1.in_features == config.dim
+            and layer.linear1.out_features == feedforward_dim
+            and layer.linear2.in_features == feedforward_dim
+            and layer.linear2.out_features == config.dim
+            for layer in model.transformer.layers
+        )
+
+    def _validate_speculative_request(
+        self,
+        *,
+        use_sampling: bool,
+        cfg_coef: float,
+        batch_size: int,
+        beam_size: int,
+        prelude_forcing: bool,
+        profile: bool,
+    ) -> None:
+        """検証済みのdecode設定だけを投機実行へ通す。"""
+        if (
+            batch_size != 1
+            or use_sampling
+            or cfg_coef != 1.0
+            or beam_size != 1
+            or not prelude_forcing
+            or profile
+        ):
+            raise ValueError(
+                "n-gram speculative decoding requires greedy, batch-1, CFG-1 "
+                "generation with prelude forcing and profiling disabled"
+            )
+        self._validate_speculative_ngram(profile=profile)
 
     # ------------------------------------------------------------------
     def _generate_token_stream(
@@ -761,12 +855,13 @@ class TranscriptionModel:
         detect_tempo: TempoDetection = "best-effort",
         profile: bool = False,
         log_progress: bool = True,
+        *,
+        speculative_decoding: bool = False,
     ) -> bytes:
         """Same as :meth:`transcribe` but returns a MIDI file as bytes."""
         if not TranscriptionModel._can_use_prepared_audio_fast_path(self):
             beat_grid = self.detect_beat_grid_for(audio, detect_tempo)
-            events = self.transcribe(
-                audio,
+            options = dict(
                 use_sampling=use_sampling,
                 temperature=temperature,
                 cfg_coef=cfg_coef,
@@ -778,13 +873,24 @@ class TranscriptionModel:
                 profile=profile,
                 log_progress=log_progress,
             )
+            if speculative_decoding:
+                options["speculative_decoding"] = True
+            events = self.transcribe(audio, **options)
             return self.events_to_midi_bytes(events, beat_grid=beat_grid)
 
+        if speculative_decoding:
+            self._validate_speculative_request(
+                use_sampling=use_sampling,
+                cfg_coef=cfg_coef,
+                batch_size=self._resolve_batch_size(batch_size, prelude_forcing),
+                beam_size=beam_size,
+                prelude_forcing=prelude_forcing,
+                profile=profile,
+            )
         with profile_timed(profile, "load audio", device=self._device):
             wav = self._prepare_audio(audio)
         beat_grid = self._detect_beat_grid_prepared(wav, detect_tempo)
-        events = self._transcribe_prepared(
-            wav,
+        options = dict(
             use_sampling=use_sampling,
             temperature=temperature,
             cfg_coef=cfg_coef,
@@ -796,6 +902,9 @@ class TranscriptionModel:
             profile=profile,
             log_progress=log_progress,
         )
+        if speculative_decoding:
+            options["_speculative_ngram"] = True
+        events = self._transcribe_prepared(wav, **options)
         return self.events_to_midi_bytes(events, beat_grid=beat_grid)
 
     def detect_beat_grid_for(
