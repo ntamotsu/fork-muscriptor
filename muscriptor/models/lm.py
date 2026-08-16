@@ -4,10 +4,11 @@ Adapted from audiocraft/models/lm.py.
 """
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 from torch import nn
+from torch.nn.modules import module as nn_module_hooks
 
 from muscriptor.modules.conditioners import (
     ConditioningProvider,
@@ -23,7 +24,11 @@ from muscriptor.modules.streaming import (
     _prepare_increment_plan,
     init_states,
 )
-from muscriptor.modules.transformer import StreamingTransformer
+from muscriptor.modules.transformer import (
+    StreamingMultiheadAttention,
+    StreamingTransformer,
+    StreamingTransformerLayer,
+)
 import muscriptor.utils.sampling as utils
 
 
@@ -258,6 +263,63 @@ class LMModel(nn.Module):
             next_tokens = torch.argmax(logits, dim=-1)  # [B]
         return next_tokens  # [B]
 
+    def _compute_speculative_logits(
+        self,
+        sequence: torch.Tensor,
+        cfg_conditions: ConditionTensors,
+        model_state: ModelState,
+        forbidden_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:  # [1, T, card]
+        """greedy draftの複数tokenを1回で検証するlogitsを返す。"""
+        logits = self(
+            sequence,
+            cfg_conditions,
+            first_step=False,
+            model_state=model_state,
+        ).float()
+        logits[..., 1393:] = -torch.inf
+        if forbidden_tokens is not None:
+            logits[..., forbidden_tokens] = -torch.inf
+        return logits
+
+    def _can_use_speculative_greedy(self) -> bool:
+        """既存の拡張seamを迂回せずblock検証できるかを返す。"""
+
+        def uses_method(instance, name: str, expected: Callable) -> bool:
+            method = getattr(instance, name)
+            return (
+                getattr(method, "__self__", None) is instance
+                and getattr(method, "__func__", None) is expected
+            )
+
+        for name, expected in _SPECULATIVE_LM_METHODS.items():
+            if not uses_method(self, name, expected):
+                return False
+        if not uses_method(
+            self.transformer,
+            "forward",
+            _SPECULATIVE_TRANSFORMER_FORWARD,
+        ):
+            return False
+        for layer in self.transformer.layers:
+            if not uses_method(layer, "forward", _SPECULATIVE_LAYER_FORWARD):
+                return False
+            if not uses_method(
+                layer.self_attn,
+                "forward",
+                _SPECULATIVE_ATTENTION_FORWARD,
+            ):
+                return False
+        if (
+            nn_module_hooks._global_forward_hooks
+            or nn_module_hooks._global_forward_pre_hooks
+        ):
+            return False
+        return not any(
+            module._forward_hooks or module._forward_pre_hooks
+            for module in self.modules()
+        )
+
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
@@ -279,6 +341,8 @@ class LMModel(nn.Module):
         beam_length_score_alpha: float = 0.75,
         forbidden_tokens: torch.Tensor | list[int] | None = None,
         profile: bool = False,
+        _draft_provider: Callable[[], tuple[int, ...] | None] | None = None,
+        _speculative_stop_token: int | None = None,
     ) -> Iterator[torch.Tensor]:
         """Autoregressively generate tokens, yielding one timestep at a time.
 
@@ -311,6 +375,15 @@ class LMModel(nn.Module):
             )
 
         cfg_coef = self.cfg_coef if cfg_coef is None else cfg_coef
+        if _draft_provider is not None and not self._can_use_speculative_greedy():
+            _draft_provider = None
+            _speculative_stop_token = None
+        if _draft_provider is not None and (
+            use_sampling or beam_size != 1 or cfg_coef != 1.0 or num_samples != 1
+        ):
+            raise ValueError(
+                "speculative decoding only supports greedy, batch-1, CFG-1 generation"
+            )
 
         # Build condition tensors (with null conditions appended for CFG)
         if conditions:
@@ -397,9 +470,13 @@ class LMModel(nn.Module):
                 yield gen_sequence[:, t + 1]
 
         last_offset = start_offset - 1
+        skipped_offsets = 0
         with self.autocast:
             for offset in range(start_offset, max_gen_len):
                 last_offset = offset
+                if skipped_offsets:
+                    skipped_offsets -= 1
+                    continue
                 first_iter = offset == start_offset
                 input_ = (
                     gen_sequence[:, : offset + 1]
@@ -413,6 +490,74 @@ class LMModel(nn.Module):
                         done = (gen_sequence == early_stop_on_token).any(dim=1).all()
                         if done:
                             break
+
+                    if _draft_provider is not None and not first_iter:
+                        draft = _draft_provider()
+                        remaining = max_gen_len - offset
+                        if draft is not None and 2 <= len(draft) <= remaining:
+                            draft_tensor = torch.tensor(
+                                draft,
+                                device=device,
+                                dtype=torch.long,
+                            ).view(1, -1)
+                            # 最後の確定tokenとdraft末尾以外を入力し、各rowで
+                            # draftの次tokenをまとめて検証する。
+                            verifier_input = torch.cat(
+                                [
+                                    gen_sequence[:, offset : offset + 1],
+                                    draft_tensor[:, :-1],
+                                ],
+                                dim=1,
+                            )
+                            logits = self._compute_speculative_logits(
+                                verifier_input,
+                                cfg_conditions,
+                                model_state,
+                                forbidden_tokens=forbidden_tokens,
+                            )
+                            target_tokens = torch.argmax(logits, dim=-1)
+                            target_ids = target_tokens[0].tolist()
+
+                            accepted = len(draft)
+                            for index, (target, proposed) in enumerate(
+                                zip(target_ids, draft, strict=True)
+                            ):
+                                if target != proposed:
+                                    accepted = index + 1
+                                    break
+
+                            stop_after_block = False
+                            stop_tokens = {
+                                token
+                                for token in (
+                                    early_stop_on_token,
+                                    _speculative_stop_token,
+                                )
+                                if token is not None
+                            }
+                            if stop_tokens:
+                                for index, token in enumerate(target_ids[:accepted]):
+                                    if token in stop_tokens:
+                                        accepted = index + 1
+                                        stop_after_block = True
+                                        break
+
+                            gen_sequence[:, offset + 1 : offset + accepted + 1] = (
+                                target_tokens[:, :accepted]
+                            )
+                            # block forwardはdraft全体をcacheへ書くが、確定分だけ
+                            # offsetを進めれば、棄却tailは次回同じ位置へ上書きされる。
+                            _increment_steps_from_plan(
+                                increment_plan,
+                                model_state,
+                                increment=accepted,
+                            )
+                            skipped_offsets = accepted - 1
+                            for index in range(accepted):
+                                yield gen_sequence[:, offset + index + 1]
+                            if stop_after_block:
+                                return
+                            continue
 
                     next_token = self._sample_next_token(
                         input_,
@@ -555,3 +700,14 @@ class LMModel(nn.Module):
             best_sequence = gen_sequence[best_global]  # [num_samples, T]
             for t in range(last_offset + 1):
                 yield best_sequence[:, t + 1]
+
+
+# class-level monkeypatchも検出できるよう、module import時のdescriptorを保持する。
+_SPECULATIVE_LM_METHODS = {
+    "forward": LMModel.forward,
+    "_compute_logits": LMModel._compute_logits,
+    "_sample_next_token": LMModel._sample_next_token,
+}
+_SPECULATIVE_TRANSFORMER_FORWARD = StreamingTransformer.forward
+_SPECULATIVE_LAYER_FORWARD = StreamingTransformerLayer.forward
+_SPECULATIVE_ATTENTION_FORWARD = StreamingMultiheadAttention.forward

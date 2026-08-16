@@ -25,6 +25,7 @@ from muscriptor.events import (
 )
 from muscriptor.generation_telemetry import ChunkGenerationStats
 from muscriptor.models.lm import LMModel, TorchAutocast
+from muscriptor.models.speculative import HistoryNgramDraft
 from muscriptor.modules.conditioners import (
     ClassConditioner,
     ConditioningAttributes,
@@ -397,9 +398,12 @@ class TranscriptionModel:
         log_progress: bool = True,
         *,
         _generation_observer: Callable[[ChunkGenerationStats], None] | None = None,
+        _speculative_ngram: bool = False,
     ) -> Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent]:
         """canonicalize済みの音声から採譜eventを生成する。"""
         batch_size = self._resolve_batch_size(batch_size, prelude_forcing)
+        if _speculative_ngram:
+            self._validate_speculative_ngram(profile=profile)
 
         # Exact names only here — the CLI resolves abbreviations before
         # calling in (resolve_instrument_names).
@@ -443,7 +447,7 @@ class TranscriptionModel:
         # timing baseline (t0) for the first chunk, before any tokens are gen'd.
         yield ProgressEvent(completed=0, total=num_chunks)
 
-        if _generation_observer is None:
+        if _generation_observer is None and not _speculative_ngram:
             token_stream = self._generate_token_stream(
                 all_conditions,
                 seek_times,
@@ -459,6 +463,11 @@ class TranscriptionModel:
                 profile=profile,
             )
         else:
+            private_options = {}
+            if _generation_observer is not None:
+                private_options["_generation_observer"] = _generation_observer
+            if _speculative_ngram:
+                private_options["_speculative_ngram"] = True
             token_stream = self._generate_token_stream(
                 all_conditions,
                 seek_times,
@@ -472,7 +481,7 @@ class TranscriptionModel:
                 beam_size,
                 forbidden_tokens,
                 profile=profile,
-                _generation_observer=_generation_observer,
+                **private_options,
             )
 
         yield from decode_model_tokens(
@@ -502,6 +511,24 @@ class TranscriptionModel:
             )
         return batch_size
 
+    def _validate_speculative_ngram(self, *, profile: bool) -> None:
+        """実機でexactnessと速度を確認済みの構成だけを許可する。"""
+        model = self._model
+        supported = (
+            self._device.type == "mps"
+            and type(model) is LMModel
+            and model.emb.weight.dtype == torch.float16
+            and model.dim == 1536
+            and len(model.transformer.layers) == 48
+            and not profile
+            and model._can_use_speculative_greedy()
+        )
+        if not supported:
+            raise ValueError(
+                "n-gram speculative decoding is currently verified only for "
+                "the large float16 model on MPS without profiling or hooks"
+            )
+
     # ------------------------------------------------------------------
     def _generate_token_stream(
         self,
@@ -519,6 +546,7 @@ class TranscriptionModel:
         profile: bool = False,
         *,
         _generation_observer: Callable[[ChunkGenerationStats], None] | None = None,
+        _speculative_ngram: bool = False,
     ) -> Iterator[int | ChunkBoundary | ProgressEvent]:
         """Generate tokens and yield them per chunk, as soon as they are ready.
 
@@ -539,6 +567,13 @@ class TranscriptionModel:
         """
         eos_id = self._tokenizer.eos_id
         num_chunks = len(seek_times)
+        if _speculative_ngram and (
+            batch_size != 1 or use_sampling or cfg_coef != 1.0 or beam_size != 1
+        ):
+            raise ValueError(
+                "n-gram speculative decoding requires greedy, batch-1, CFG-1 generation"
+            )
+        draft_history = HistoryNgramDraft() if _speculative_ngram else None
 
         # Chunks in a batch generate concurrently, so with batch_size > 1 the
         # previous chunk's open notes aren't known when the next one starts —
@@ -587,6 +622,13 @@ class TranscriptionModel:
                 observed_rows = 0
                 eos_steps: list[int | None] = [None] * n
 
+            generation_options = {}
+            if draft_history is not None:
+                draft_history.start_chunk(self._model.initial_token_id)
+                generation_options = {
+                    "_draft_provider": draft_history.propose,
+                    "_speculative_stop_token": eos_id,
+                }
             steps = self._model.generate(
                 prompt=prompt,
                 conditions=batch_conditions,
@@ -600,10 +642,14 @@ class TranscriptionModel:
                 beam_size=beam_size,
                 forbidden_tokens=forbidden_tokens,
                 profile=profile,
+                **generation_options,
             )
+            generation_completed = False
             try:
                 for step in steps:
                     row = step.tolist()  # one token per chunk: [n]
+                    if draft_history is not None:
+                        draft_history.observe(row[0])
                     if _generation_observer is not None:
                         observed_rows += 1
                         generated_step = observed_rows - prompt_tokens
@@ -632,10 +678,16 @@ class TranscriptionModel:
                     # beam=1はtolist済みのhost状態で停止し、LM側のdevice scanを省く。
                     if beam_size == 1 and active == n:
                         break
+                generation_completed = True
             finally:
                 close = getattr(steps, "close", None)
                 if callable(close):
                     close()
+                if draft_history is not None:
+                    if generation_completed:
+                        draft_history.finish_chunk()
+                    else:
+                        draft_history.discard_chunk()
 
             if _generation_observer is not None:
                 generated_rows = max(0, observed_rows - prompt_tokens)

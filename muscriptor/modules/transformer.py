@@ -79,6 +79,8 @@ class StreamingMultiheadAttention(StatefulModule):
         self,
         query: torch.Tensor,
         model_state: ModelState | None = None,
+        *,
+        _attention_mask: torch.Tensor | None = None,
     ):
         state = self.get_state(model_state)
         projected = nn.functional.linear(query, self.in_proj_weight)
@@ -103,7 +105,15 @@ class StreamingMultiheadAttention(StatefulModule):
         # model hits (single-token decode and square prefill) stay mask-free
         # and dispatch to the fused (flash) CPU/CUDA kernels.
         T_q, T_k = q_t.shape[2], k_t.shape[2]
-        if T_q == 1:
+        if _attention_mask is not None:
+            x = F.scaled_dot_product_attention(
+                q_t,
+                k_t,
+                v_t,
+                attn_mask=_attention_mask,
+                dropout_p=0.0,
+            )
+        elif T_q == 1:
             # One query row, bottom-right aligned: nothing is masked.
             x = F.scaled_dot_product_attention(q_t, k_t, v_t, dropout_p=0.0)
         elif T_q == T_k:
@@ -148,8 +158,18 @@ class StreamingTransformerLayer(nn.Module):
         self,
         x: torch.Tensor,
         model_state: ModelState | None = None,
+        *,
+        _attention_mask: torch.Tensor | None = None,
     ):
-        x = x + self.self_attn(self.norm1(x), model_state=model_state)
+        if _attention_mask is None:
+            attention = self.self_attn(self.norm1(x), model_state=model_state)
+        else:
+            attention = self.self_attn(
+                self.norm1(x),
+                model_state=model_state,
+                _attention_mask=_attention_mask,
+            )
+        x = x + attention
         x = x + self.linear2(F.gelu(self.linear1(self.norm2(x))))
         return x
 
@@ -217,6 +237,28 @@ class StreamingTransformer(StatefulModule):
         )
         x = x + (pos_emb * (positions >= 0).float()).to(x.dtype)
 
+        attention_mask = None
+        if model_state is not None and T > 1:
+            # 投機的decodeでは、cache済みprefixの右下へcausal maskを揃える。
+            # 1枚だけ構築し、全layerで共有して重複生成を避ける。
+            attention_state = self.layers[0].self_attn.get_state(model_state)
+            if attention_state is not None:
+                past_length = attention_state["offset"]
+                if past_length > 0:
+                    attention_mask = torch.ones(
+                        T,
+                        past_length + T,
+                        device=x.device,
+                        dtype=torch.bool,
+                    ).tril(diagonal=past_length)
+
         for layer in self.layers:
-            x = layer(x, model_state=model_state)
+            if attention_mask is None:
+                x = layer(x, model_state=model_state)
+            else:
+                x = layer(
+                    x,
+                    model_state=model_state,
+                    _attention_mask=attention_mask,
+                )
         return x
