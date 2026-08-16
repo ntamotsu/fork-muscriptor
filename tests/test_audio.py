@@ -12,15 +12,64 @@ from muscriptor.utils.resample import ResampleFrac, resample_frac
 
 @pytest.fixture(autouse=True)
 def clear_resampler_cache():
-    with audio_utils._RESAMPLER_CACHE_LOCK:
-        audio_utils._RESAMPLER_CACHE.clear()
+    audio_utils._clear_resampler_cache()
     yield
-    with audio_utils._RESAMPLER_CACHE_LOCK:
-        audio_utils._RESAMPLER_CACHE.clear()
+    audio_utils._clear_resampler_cache()
 
 
 def test_audio_module_keeps_resample_frac_reexport():
     assert audio_utils.resample_frac is resample_frac
+
+
+def test_clear_resampler_cache_forces_the_next_call_to_rebuild(monkeypatch):
+    init_calls = 0
+    original_init = ResampleFrac.__init__
+
+    def counted_init(self, *args, **kwargs):
+        nonlocal init_calls
+        init_calls += 1
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(ResampleFrac, "__init__", counted_init)
+    monkeypatch.setattr(ResampleFrac, "forward", lambda _self, waveform: waveform)
+    waveform = torch.zeros(32, dtype=torch.float32)
+
+    audio_utils.resample(waveform, 29, 13)
+    audio_utils.resample(waveform, 29, 13)
+    audio_utils._clear_resampler_cache()
+    audio_utils.resample(waveform, 29, 13)
+
+    assert init_calls == 2
+
+
+def test_clear_resampler_cache_does_not_republish_an_inflight_build(monkeypatch):
+    init_calls = 0
+    constructor_entered = threading.Event()
+    release_constructor = threading.Event()
+    original_init = ResampleFrac.__init__
+
+    def blocked_init(self, *args, **kwargs):
+        nonlocal init_calls
+        init_calls += 1
+        constructor_entered.set()
+        release_constructor.wait(timeout=2)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(ResampleFrac, "__init__", blocked_init)
+    monkeypatch.setattr(ResampleFrac, "forward", lambda _self, waveform: waveform)
+    waveform = torch.zeros(32, dtype=torch.float32)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(audio_utils.resample, waveform, 47, 23)
+        try:
+            assert constructor_entered.wait(timeout=2)
+            audio_utils._clear_resampler_cache()
+        finally:
+            release_constructor.set()
+        assert first.result(timeout=2) is waveform
+    audio_utils.resample(waveform, 47, 23)
+
+    assert init_calls == 2
 
 
 def test_resample_reuses_one_prepared_resampler_for_the_same_key(monkeypatch):
@@ -78,6 +127,67 @@ def test_resample_evicts_the_least_recently_used_entry_after_eight_keys(
     assert init_calls == 10
 
 
+def test_resample_does_not_retain_an_entry_over_the_buffer_byte_limit(
+    monkeypatch,
+):
+    init_calls = 0
+    original_init = ResampleFrac.__init__
+
+    def counted_init(self, *args, **kwargs):
+        nonlocal init_calls
+        init_calls += 1
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        audio_utils,
+        "_RESAMPLER_CACHE_MAX_ENTRY_BYTES",
+        0,
+        raising=False,
+    )
+    monkeypatch.setattr(ResampleFrac, "__init__", counted_init)
+    monkeypatch.setattr(ResampleFrac, "forward", lambda _self, waveform: waveform)
+    waveform = torch.zeros(32, dtype=torch.float32)
+
+    audio_utils.resample(waveform, 43, 17)
+    audio_utils.resample(waveform, 43, 17)
+
+    assert (init_calls, len(audio_utils._RESAMPLER_CACHE)) == (2, 0)
+
+
+def test_resample_evicts_lru_entries_to_stay_within_total_buffer_bytes(
+    monkeypatch,
+):
+    probe = ResampleFrac(31, 19)
+    one_entry_bytes = audio_utils._resampler_buffer_bytes(probe)
+    init_calls = 0
+    original_init = ResampleFrac.__init__
+
+    def counted_init(self, *args, **kwargs):
+        nonlocal init_calls
+        init_calls += 1
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        audio_utils,
+        "_RESAMPLER_CACHE_MAX_TOTAL_BYTES",
+        one_entry_bytes,
+        raising=False,
+    )
+    monkeypatch.setattr(ResampleFrac, "__init__", counted_init)
+    monkeypatch.setattr(ResampleFrac, "forward", lambda _self, waveform: waveform)
+    waveform = torch.zeros(32, dtype=torch.float32)
+
+    audio_utils.resample(waveform, 31, 19)
+    audio_utils.resample(waveform, 62, 38)
+    audio_utils.resample(waveform, 31, 19)
+
+    assert (
+        init_calls,
+        len(audio_utils._RESAMPLER_CACHE),
+        audio_utils._cached_resampler_buffer_bytes(),
+    ) == (3, 1, one_entry_bytes)
+
+
 def test_resample_constructs_one_instance_for_concurrent_same_key(monkeypatch):
     worker_count = 4
     init_calls = 0
@@ -126,6 +236,59 @@ def test_resample_constructs_one_instance_for_concurrent_same_key(monkeypatch):
     )
 
 
+def test_resample_constructs_different_keys_in_parallel(monkeypatch):
+    constructors_meet = threading.Barrier(2)
+    device_moves_meet = threading.Barrier(2)
+    constructors_overlapped = []
+    device_moves_overlapped = []
+    original_init = ResampleFrac.__init__
+    original_to = ResampleFrac.to
+
+    def synchronized_init(self, *args, **kwargs):
+        try:
+            constructors_meet.wait(timeout=2)
+        except threading.BrokenBarrierError:
+            constructors_overlapped.append(False)
+        else:
+            constructors_overlapped.append(True)
+        original_init(self, *args, **kwargs)
+
+    def synchronized_to(self, *args, **kwargs):
+        try:
+            device_moves_meet.wait(timeout=2)
+        except threading.BrokenBarrierError:
+            device_moves_overlapped.append(False)
+        else:
+            device_moves_overlapped.append(True)
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(ResampleFrac, "__init__", synchronized_init)
+    monkeypatch.setattr(ResampleFrac, "to", synchronized_to)
+    monkeypatch.setattr(ResampleFrac, "forward", lambda _self, waveform: waveform)
+    waveform = torch.zeros(32, dtype=torch.float32)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(audio_utils.resample, waveform, orig_freq, new_freq)
+            for orig_freq, new_freq in ((83, 31), (89, 37))
+        ]
+        results = [future.result(timeout=2) for future in futures]
+
+    assert (
+        len(constructors_overlapped),
+        all(constructors_overlapped),
+        len(device_moves_overlapped),
+        all(device_moves_overlapped),
+        all(r is waveform for r in results),
+    ) == (
+        2,
+        True,
+        2,
+        True,
+        True,
+    )
+
+
 def test_resample_does_not_cache_a_failed_construction(monkeypatch):
     init_calls = 0
     original_init = ResampleFrac.__init__
@@ -147,6 +310,75 @@ def test_resample_does_not_cache_a_failed_construction(monkeypatch):
     third = audio_utils.resample(waveform, 79, 31)
 
     assert (init_calls, second is waveform, third is waveform) == (2, True, True)
+
+
+def test_resample_shares_a_construction_error_then_retries_on_a_new_call(monkeypatch):
+    worker_count = 2
+    init_calls = 0
+    lock_acquisitions = 0
+    start = threading.Barrier(worker_count)
+    release_constructor = threading.Event()
+    constructor_entered = threading.Event()
+    acquisitions_changed = threading.Condition()
+    original_init = ResampleFrac.__init__
+    shared_error = RuntimeError("shared construction failure")
+
+    class ObservedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            nonlocal lock_acquisitions
+            self._lock.acquire()
+            with acquisitions_changed:
+                lock_acquisitions += 1
+                acquisitions_changed.notify_all()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    def fail_first(self, *args, **kwargs):
+        nonlocal init_calls
+        init_calls += 1
+        if init_calls == 1:
+            constructor_entered.set()
+            release_constructor.wait(timeout=2)
+            raise shared_error
+        original_init(self, *args, **kwargs)
+
+    def run(waveform):
+        start.wait(timeout=2)
+        try:
+            audio_utils.resample(waveform, 127, 61)
+        except RuntimeError as error:
+            return error
+        return None
+
+    monkeypatch.setattr(audio_utils, "_RESAMPLER_CACHE_LOCK", ObservedLock())
+    monkeypatch.setattr(ResampleFrac, "__init__", fail_first)
+    monkeypatch.setattr(ResampleFrac, "forward", lambda _self, waveform: waveform)
+    waveform = torch.zeros(32, dtype=torch.float32)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(run, waveform) for _ in range(worker_count)]
+        try:
+            assert constructor_entered.wait(timeout=2)
+            with acquisitions_changed:
+                assert acquisitions_changed.wait_for(
+                    lambda: lock_acquisitions >= worker_count,
+                    timeout=2,
+                )
+        finally:
+            release_constructor.set()
+        errors = [future.result(timeout=2) for future in futures]
+    retried = audio_utils.resample(waveform, 127, 61)
+
+    assert (init_calls, errors, retried is waveform) == (
+        2,
+        [shared_error, shared_error],
+        True,
+    )
 
 
 def test_resample_returns_the_same_tensor_without_touching_cache_for_same_rate(

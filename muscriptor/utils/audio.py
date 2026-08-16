@@ -3,6 +3,7 @@ other formats fall back to `soundfile`."""
 
 import wave
 from collections import OrderedDict
+from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock
 from typing import IO
@@ -16,11 +17,98 @@ from muscriptor.utils.resample import (
 )
 
 
+_ResamplerKey = tuple[int, int, torch.device, torch.dtype]
+
 _RESAMPLER_CACHE_MAX_SIZE = 8
-_RESAMPLER_CACHE: OrderedDict[
-    tuple[int, int, torch.device, torch.dtype], _ResampleFrac
-] = OrderedDict()
+# 一般的な44.1 kHz→16 kHzのfloat32 kernel（約0.4 MiB）は十分保持できる。
+_RESAMPLER_CACHE_MAX_ENTRY_BYTES = 64 * 1024 * 1024
+_RESAMPLER_CACHE_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+_RESAMPLER_CACHE: OrderedDict[_ResamplerKey, _ResampleFrac] = OrderedDict()
+_RESAMPLER_INFLIGHT: dict[_ResamplerKey, Future[_ResampleFrac]] = {}
 _RESAMPLER_CACHE_LOCK = Lock()
+
+
+def _clear_resampler_cache() -> None:
+    """cache済み・構築中のresampler参照を破棄する。"""
+    with _RESAMPLER_CACHE_LOCK:
+        _RESAMPLER_CACHE.clear()
+        _RESAMPLER_INFLIGHT.clear()
+
+
+def _resampler_buffer_bytes(resampler: _ResampleFrac) -> int:
+    """resamplerが保持する全bufferの論理byte数を返す。"""
+    return sum(buffer.numel() * buffer.element_size() for buffer in resampler.buffers())
+
+
+def _cached_resampler_buffer_bytes() -> int:
+    """cacheに常駐しているresampler bufferの合計byte数を返す。"""
+    return sum(_resampler_buffer_bytes(item) for item in _RESAMPLER_CACHE.values())
+
+
+def _cache_resampler(
+    key: _ResamplerKey,
+    resampler: _ResampleFrac,
+    buffer_bytes: int,
+) -> None:
+    """上限内のresamplerをLRUへ追加する。呼出側でlockを保持する。"""
+    if buffer_bytes > min(
+        _RESAMPLER_CACHE_MAX_ENTRY_BYTES,
+        _RESAMPLER_CACHE_MAX_TOTAL_BYTES,
+    ):
+        return
+    while _RESAMPLER_CACHE and (
+        len(_RESAMPLER_CACHE) >= _RESAMPLER_CACHE_MAX_SIZE
+        or _cached_resampler_buffer_bytes() + buffer_bytes
+        > _RESAMPLER_CACHE_MAX_TOTAL_BYTES
+    ):
+        _RESAMPLER_CACHE.popitem(last=False)
+    _RESAMPLER_CACHE[key] = resampler
+
+
+def _build_resampler(
+    key: _ResamplerKey,
+    future: Future[_ResampleFrac],
+) -> _ResampleFrac:
+    """global lock外でresamplerを構築し、結果を同一keyのwaiterへ共有する。"""
+    orig_freq, new_freq, device, dtype = key
+    try:
+        resampler = _ResampleFrac(orig_freq, new_freq).to(
+            device=device,
+            dtype=dtype,
+        )
+        buffer_bytes = _resampler_buffer_bytes(resampler)
+        with _RESAMPLER_CACHE_LOCK:
+            if _RESAMPLER_INFLIGHT.get(key) is future:
+                del _RESAMPLER_INFLIGHT[key]
+                _cache_resampler(key, resampler, buffer_bytes)
+    except BaseException as error:
+        with _RESAMPLER_CACHE_LOCK:
+            if _RESAMPLER_INFLIGHT.get(key) is future:
+                del _RESAMPLER_INFLIGHT[key]
+        future.set_exception(error)
+        raise
+    future.set_result(resampler)
+    return resampler
+
+
+def _get_resampler(key: _ResamplerKey) -> _ResampleFrac:
+    """cacheまたはkey別in-flightからresamplerを取得する。"""
+    with _RESAMPLER_CACHE_LOCK:
+        resampler = _RESAMPLER_CACHE.get(key)
+        if resampler is not None:
+            _RESAMPLER_CACHE.move_to_end(key)
+            return resampler
+
+        future = _RESAMPLER_INFLIGHT.get(key)
+        should_build = future is None
+        if should_build:
+            future = Future()
+            _RESAMPLER_INFLIGHT[key] = future
+
+    assert future is not None
+    if should_build:
+        return _build_resampler(key, future)
+    return future.result()
 
 
 def _read_wav_file(source) -> tuple[torch.Tensor, int]:
@@ -101,18 +189,7 @@ def resample(
     orig_freq = int(orig_freq)
     new_freq = int(new_freq)
     key = (orig_freq, new_freq, waveform.device, waveform.dtype)
-    with _RESAMPLER_CACHE_LOCK:
-        resampler = _RESAMPLER_CACHE.get(key)
-        if resampler is None:
-            resampler = _ResampleFrac(orig_freq, new_freq).to(
-                device=waveform.device,
-                dtype=waveform.dtype,
-            )
-            _RESAMPLER_CACHE[key] = resampler
-            if len(_RESAMPLER_CACHE) > _RESAMPLER_CACHE_MAX_SIZE:
-                _RESAMPLER_CACHE.popitem(last=False)
-        else:
-            _RESAMPLER_CACHE.move_to_end(key)
+    resampler = _get_resampler(key)
     # forwardはcacheを更新しないため、lock外で並行実行できる。
     return resampler(waveform)
 
