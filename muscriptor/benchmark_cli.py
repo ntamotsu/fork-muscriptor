@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -28,6 +29,7 @@ from muscriptor.benchmark import (
     run_benchmark,
 )
 from muscriptor.transcription_model import TranscriptionModel, _resolve_config
+from muscriptor.tokenizer.mt3 import resolve_instrument_names
 from muscriptor.utils.audio import load_audio
 
 
@@ -50,6 +52,10 @@ _TRANSCRIBE_PARAMETERS = {
     "log_progress": False,
 }
 _MAX_REPORT_BYTES = 16 * 1024 * 1024
+_BASE_TRANSCRIPTION_METHODS = {
+    name: inspect.getattr_static(TranscriptionModel, name)
+    for name in ("transcribe", "_transcribe_prepared", "_generate_token_stream")
+}
 
 
 @app.callback()
@@ -279,6 +285,23 @@ def _strict_synchronize(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
+def _require_base_generation_telemetry_model(model: object) -> None:
+    overridden: list[str] = []
+    for name, base_method in _BASE_TRANSCRIPTION_METHODS.items():
+        method = getattr(model, name, None)
+        if (
+            getattr(method, "__self__", None) is not model
+            or getattr(method, "__func__", None) is not base_method
+        ):
+            overridden.append(name)
+    if overridden:
+        raise typer.BadParameter(
+            "--generation-telemetry requires base TranscriptionModel "
+            "implementations for transcribe, _transcribe_prepared, and "
+            f"_generate_token_stream; overridden or missing: {', '.join(overridden)}"
+        )
+
+
 @app.command("run")
 def run_command(
     audio_file: Annotated[
@@ -345,12 +368,47 @@ def run_command(
         bool,
         typer.Option("--force", help="Overwrite an existing report."),
     ] = False,
+    instruments: Annotated[
+        str | None,
+        typer.Option(
+            "--instruments",
+            help="Comma-separated expected instrument group names.",
+        ),
+    ] = None,
+    allow_no_eos: Annotated[
+        bool,
+        typer.Option(
+            "--allow-no-eos",
+            help="Record runs whose chunks reach the generation limit without EOS.",
+        ),
+    ] = False,
+    generation_telemetry: Annotated[
+        bool,
+        typer.Option(
+            "--generation-telemetry",
+            help="Record per-chunk selected-output generation statistics.",
+        ),
+    ] = False,
 ) -> None:
     """モデルを一度だけ読み込み、転写streamを最後まで消費する時間を測る。"""
     if dtype not in {"float32", "float16", "bfloat16"}:
         raise typer.BadParameter(
             "dtype must be one of: float32, float16, bfloat16", param_hint="--dtype"
         )
+
+    instrument_names: list[str] | None = None
+    if instruments is not None:
+        try:
+            instrument_names = resolve_instrument_names(
+                token for token in instruments.split(",") if token.strip()
+            )
+        except ValueError as error:
+            raise typer.BadParameter(str(error), param_hint="--instruments") from error
+    transcribe_parameters = {
+        **_TRANSCRIBE_PARAMETERS,
+        "instruments": instrument_names,
+        "no_eos_is_ok": allow_no_eos,
+    }
 
     torch_device = _parse_device(device)
     audio_file = audio_file.resolve()
@@ -387,6 +445,8 @@ def run_command(
         device=torch_device,
         dtype=dtype,
     )
+    if generation_telemetry:
+        _require_base_generation_telemetry_model(model)
 
     model_name = model_label or model_path.stem
     input_name = audio_id or audio_file.name
@@ -407,7 +467,7 @@ def run_command(
                 "num_samples": wav.shape[-1],
                 "duration_seconds": wav.shape[-1] / 16_000,
             },
-            "transcribe": _TRANSCRIBE_PARAMETERS,
+            "transcribe": transcribe_parameters,
         },
     )
     benchmark_environment = BenchmarkEnvironment(
@@ -417,15 +477,26 @@ def run_command(
     protocol = BenchmarkProtocol(
         warmup_runs=warmup_runs,
         measured_runs=runs,
+        generation_telemetry=("selected-output-v1" if generation_telemetry else "none"),
     )
 
+    def instrumented_stream(observer):
+        return model._transcribe_prepared(
+            wav,
+            **transcribe_parameters,
+            _generation_observer=observer,
+        )
+
     report = run_benchmark(
-        lambda: model.transcribe((wav, 16_000), **_TRANSCRIBE_PARAMETERS),
+        lambda: model.transcribe((wav, 16_000), **transcribe_parameters),
         workload=workload,
         environment=benchmark_environment,
         protocol=protocol,
         synchronize=lambda: _strict_synchronize(torch_device),
         source=_source_metadata(),
+        instrumented_event_stream_factory=(
+            instrumented_stream if generation_telemetry else None
+        ),
     )
     _ensure_unchanged(audio_file, audio_snapshot)
     _ensure_unchanged(model_path, model_snapshot)

@@ -22,6 +22,7 @@ from muscriptor.benchmark import (
     run_benchmark,
 )
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
+from muscriptor.generation_telemetry import ChunkGenerationStats
 
 
 def _note_stream(
@@ -57,6 +58,19 @@ class _ManualClock:
         self.now_ns += nanoseconds
 
 
+def _chunk_stats(chunk_index: int = 0) -> ChunkGenerationStats:
+    return ChunkGenerationStats(
+        chunk_index=chunk_index,
+        seek_time_us=chunk_index * 5_000_000,
+        prompt_tokens=0,
+        observed_rows=3,
+        generated_rows=3,
+        eos_step=3,
+        max_gen_len=2000,
+        hit_generation_limit=False,
+    )
+
+
 def test_protocol_rejects_non_positive_measured_runs():
     with pytest.raises(ValueError, match="measured_runs"):
         BenchmarkProtocol(measured_runs=0)
@@ -65,6 +79,15 @@ def test_protocol_rejects_non_positive_measured_runs():
 def test_protocol_rejects_negative_warmup_runs():
     with pytest.raises(ValueError, match="warmup_runs"):
         BenchmarkProtocol(warmup_runs=-1)
+
+
+@pytest.mark.parametrize(
+    "generation_telemetry",
+    [True, 1, [], "unknown"],
+)
+def test_protocol_rejects_invalid_generation_telemetry(generation_telemetry):
+    with pytest.raises(ValueError, match="generation_telemetry"):
+        BenchmarkProtocol(generation_telemetry=generation_telemetry)
 
 
 @pytest.mark.parametrize(
@@ -82,6 +105,32 @@ def test_sample_rejects_non_positive_wall_time(wall_time_ns):
             event_counts=EventCounts(note_start=0, note_end=0, progress=0),
             stream_digest="stream",
             note_digest="notes",
+        )
+
+
+@pytest.mark.parametrize(
+    "chunk_generation_stats",
+    [
+        [_chunk_stats()],
+        (_chunk_stats(), object()),
+        (_chunk_stats(0), _chunk_stats(2)),
+        (_chunk_stats(0), _chunk_stats(0)),
+    ],
+)
+def test_sample_requires_contiguous_typed_chunk_generation_stats(
+    chunk_generation_stats,
+):
+    with pytest.raises(ValueError, match="chunk_generation_stats|chunk_index"):
+        BenchmarkSample(
+            index=0,
+            wall_time_ns=1,
+            first_progress_ns=None,
+            first_note_ns=None,
+            progress_milestones=(),
+            event_counts=EventCounts(note_start=0, note_end=0, progress=0),
+            stream_digest="stream",
+            note_digest="notes",
+            chunk_generation_stats=chunk_generation_stats,
         )
 
 
@@ -114,6 +163,42 @@ def test_report_rejects_a_sample_count_that_differs_from_the_protocol():
             workload=BenchmarkWorkload("fake"),
             environment=BenchmarkEnvironment("cpu-test"),
             protocol=BenchmarkProtocol(measured_runs=2),
+            samples=(sample,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("generation_telemetry", "chunk_generation_stats"),
+    [
+        ("none", ()),
+        ("selected-output-v1", None),
+    ],
+)
+def test_report_requires_protocol_and_sample_telemetry_to_match(
+    generation_telemetry,
+    chunk_generation_stats,
+):
+    sample = BenchmarkSample(
+        index=0,
+        wall_time_ns=1,
+        first_progress_ns=None,
+        first_note_ns=None,
+        progress_milestones=(),
+        event_counts=EventCounts(note_start=0, note_end=0, progress=0),
+        stream_digest="stream",
+        note_digest="notes",
+        chunk_generation_stats=chunk_generation_stats,
+    )
+
+    with pytest.raises(ValueError, match="generation_telemetry"):
+        BenchmarkReport(
+            workload=BenchmarkWorkload("fake"),
+            environment=BenchmarkEnvironment("cpu-test"),
+            protocol=BenchmarkProtocol(
+                warmup_runs=0,
+                measured_runs=1,
+                generation_telemetry=generation_telemetry,
+            ),
             samples=(sample,),
         )
 
@@ -164,6 +249,147 @@ def test_run_benchmark_discards_warmups_and_consumes_every_lazy_stream():
     )
 
     assert (calls, yielded) == (5, 20)
+
+
+def test_run_benchmark_discards_warmup_telemetry_and_records_measured_runs():
+    calls = 0
+
+    def unexpected_plain_stream():
+        pytest.fail("instrumented runs must use the observer-aware factory")
+
+    def instrumented_stream(observer):
+        nonlocal calls
+        calls += 1
+        observer(
+            ChunkGenerationStats(
+                chunk_index=0,
+                seek_time_us=calls,
+                prompt_tokens=0,
+                observed_rows=3,
+                generated_rows=3,
+                eos_step=3,
+                max_gen_len=2000,
+                hit_generation_limit=False,
+            )
+        )
+        yield from _note_stream()
+
+    report = run_benchmark(
+        unexpected_plain_stream,
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(
+            warmup_runs=2,
+            measured_runs=2,
+            generation_telemetry="selected-output-v1",
+        ),
+        instrumented_event_stream_factory=instrumented_stream,
+    )
+
+    assert (
+        calls,
+        tuple(
+            sample.chunk_generation_stats[0].seek_time_us for sample in report.samples
+        ),
+    ) == (4, (3, 4))
+
+
+def test_run_benchmark_rejects_missing_stats_for_instrumented_progress():
+    def instrumented_stream(_observer):
+        yield from _note_stream()
+
+    with pytest.raises(ValueError, match="chunk_generation_stats count"):
+        run_benchmark(
+            lambda: _note_stream(),
+            workload=BenchmarkWorkload("fake"),
+            environment=BenchmarkEnvironment("cpu-test"),
+            protocol=BenchmarkProtocol(
+                warmup_runs=0,
+                measured_runs=1,
+                generation_telemetry="selected-output-v1",
+            ),
+            instrumented_event_stream_factory=instrumented_stream,
+            clock_ns=iter((0, 1, 2, 3, 4)).__next__,
+        )
+
+
+def test_run_benchmark_releases_warmup_telemetry_before_the_final_sync():
+    actions: list[str] = []
+    stream_calls = 0
+    sync_count = 0
+
+    class ObservedStats:
+        def __del__(self):
+            actions.append("release-stats")
+
+    def instrumented_stream(observer):
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 1:
+            observer(ObservedStats())
+            yield from ()
+        else:
+            yield ProgressEvent(completed=0, total=0)
+
+    def synchronize():
+        nonlocal sync_count
+        sync_count += 1
+        actions.append(f"sync-{sync_count}")
+
+    run_benchmark(
+        lambda: (),
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(
+            warmup_runs=1,
+            measured_runs=1,
+            generation_telemetry="selected-output-v1",
+        ),
+        instrumented_event_stream_factory=instrumented_stream,
+        synchronize=synchronize,
+        clock_ns=iter((0, 1, 2)).__next__,
+    )
+
+    assert actions.index("release-stats") < actions.index("sync-2")
+
+
+@pytest.mark.parametrize(
+    ("generation_telemetry", "use_instrumented_factory"),
+    [
+        ("none", True),
+        ("selected-output-v1", False),
+    ],
+)
+def test_run_benchmark_requires_factory_and_protocol_telemetry_to_match(
+    generation_telemetry,
+    use_instrumented_factory,
+):
+    calls = []
+
+    def plain_stream():
+        calls.append("plain")
+        return ()
+
+    def instrumented_stream(_observer):
+        calls.append("instrumented")
+        return ()
+
+    with pytest.raises(ValueError, match="generation_telemetry"):
+        run_benchmark(
+            plain_stream,
+            workload=BenchmarkWorkload("fake"),
+            environment=BenchmarkEnvironment("cpu-test"),
+            protocol=BenchmarkProtocol(
+                warmup_runs=0,
+                measured_runs=1,
+                generation_telemetry=generation_telemetry,
+            ),
+            instrumented_event_stream_factory=(
+                instrumented_stream if use_instrumented_factory else None
+            ),
+        )
+
+    assert calls == []
 
 
 def test_run_benchmark_synchronizes_outside_each_timed_lazy_stream():
@@ -316,6 +542,80 @@ def test_run_benchmark_releases_previous_event_before_an_empty_run():
     ) == ((10, 10), True)
 
 
+def test_run_benchmark_releases_measured_iterator_before_the_final_sync():
+    actions: list[str] = []
+    sync_count = 0
+
+    class ObservedIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
+
+        def __del__(self):
+            actions.append("release-stream")
+
+    def synchronize():
+        nonlocal sync_count
+        sync_count += 1
+        actions.append(f"sync-{sync_count}")
+
+    run_benchmark(
+        ObservedIterator,
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=1),
+        synchronize=synchronize,
+        clock_ns=iter((0, 1)).__next__,
+    )
+
+    assert actions.index("release-stream") < actions.index("sync-2")
+
+
+def test_run_benchmark_closes_externally_referenced_iterators_before_sync():
+    actions: list[str] = []
+    iterators = []
+    sync_count = 0
+
+    class ObservedIterator:
+        def __init__(self, index):
+            self.index = index
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            actions.append(f"close-{self.index}")
+
+    def stream():
+        iterator = ObservedIterator(len(iterators))
+        iterators.append(iterator)
+        return iterator
+
+    def synchronize():
+        nonlocal sync_count
+        sync_count += 1
+        actions.append(f"sync-{sync_count}")
+
+    run_benchmark(
+        stream,
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=1, measured_runs=1),
+        synchronize=synchronize,
+        clock_ns=iter((0, 1)).__next__,
+    )
+
+    assert (
+        actions.index("close-0") < actions.index("sync-2"),
+        actions.index("close-1") < actions.index("sync-4"),
+    ) == (True, True)
+
+
 def test_run_benchmark_releases_previous_event_before_a_later_run_fails():
     clock = _ManualClock()
     actions: list[str] = []
@@ -443,7 +743,11 @@ def test_report_marks_varying_output_as_unstable():
     )
 
 
-def test_report_v1_round_trips_as_canonical_json():
+def test_report_v2_round_trips_generation_telemetry_as_canonical_json():
+    def instrumented_stream(observer):
+        observer(_chunk_stats())
+        yield from _note_stream()
+
     report = run_benchmark(
         lambda: _note_stream(),
         workload=BenchmarkWorkload(
@@ -454,22 +758,31 @@ def test_report_v1_round_trips_as_canonical_json():
             "m4-test",
             {"device": {"type": "mps"}, "torch_version": "test"},
         ),
-        protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=1),
+        protocol=BenchmarkProtocol(
+            warmup_runs=0,
+            measured_runs=1,
+            generation_telemetry="selected-output-v1",
+        ),
         source={
             "git_commit": "deadbeef",
             "git_dirty": False,
             "created_at_utc": "2026-08-16T00:00:00Z",
         },
         clock_ns=iter((10, 20, 30, 40, 50)).__next__,
+        instrumented_event_stream_factory=instrumented_stream,
     )
 
     payload = report.to_json()
     restored = type(report).from_json(payload)
 
-    assert (restored, restored.to_json()) == (report, payload)
+    assert (
+        restored,
+        restored.to_json(),
+        restored.samples[0].chunk_generation_stats,
+    ) == (report, payload, (_chunk_stats(),))
 
 
-def test_report_v1_rejects_unknown_schema_version():
+def test_report_v1_is_migrated_to_v2_without_generation_telemetry():
     report = run_benchmark(
         lambda: _note_stream(),
         workload=BenchmarkWorkload("fake"),
@@ -478,13 +791,124 @@ def test_report_v1_rejects_unknown_schema_version():
         clock_ns=iter((0, 1, 2, 3, 4)).__next__,
     )
     data = json.loads(report.to_json())
-    data["schema_version"] = 2
+    data["schema_version"] = 1
+    del data["protocol"]["generation_telemetry"]
+    del data["samples"][0]["chunk_generation_stats"]
+
+    restored = type(report).from_json(json.dumps(data))
+
+    assert (
+        restored.schema_version,
+        restored.protocol.generation_telemetry,
+        restored.samples[0].chunk_generation_stats,
+        json.loads(restored.to_json())["schema_version"],
+    ) == (2, "none", None, 2)
+
+
+@pytest.mark.parametrize(
+    "v2_field",
+    ["protocol.generation_telemetry", "sample.chunk_generation_stats"],
+)
+def test_report_v1_rejects_v2_fields_instead_of_downgrading_them(v2_field):
+    report = run_benchmark(
+        lambda: _note_stream(),
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=1),
+        clock_ns=iter((0, 1, 2, 3, 4)).__next__,
+    )
+    data = json.loads(report.to_json())
+    data["schema_version"] = 1
+    if v2_field.startswith("protocol"):
+        del data["samples"][0]["chunk_generation_stats"]
+    else:
+        del data["protocol"]["generation_telemetry"]
+
+    with pytest.raises(ValueError, match="generation_telemetry|chunk_generation_stats"):
+        type(report).from_json(json.dumps(data))
+
+
+@pytest.mark.parametrize("schema_version", [3, True, [], "2", None])
+def test_report_rejects_unknown_schema_version(schema_version):
+    report = run_benchmark(
+        lambda: _note_stream(),
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=1),
+        clock_ns=iter((0, 1, 2, 3, 4)).__next__,
+    )
+    data = json.loads(report.to_json())
+    data["schema_version"] = schema_version
 
     with pytest.raises(ValueError, match="schema_version"):
         type(report).from_json(json.dumps(data))
 
 
-def test_report_v1_rejects_non_positive_wall_time_from_json():
+@pytest.mark.parametrize(
+    "missing_field",
+    ["protocol.generation_telemetry", "sample.chunk_generation_stats"],
+)
+def test_report_v2_rejects_missing_generation_telemetry_fields(missing_field):
+    report = run_benchmark(
+        lambda: _note_stream(),
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(warmup_runs=0, measured_runs=1),
+        clock_ns=iter((0, 1, 2, 3, 4)).__next__,
+    )
+    data = json.loads(report.to_json())
+    if missing_field.startswith("protocol"):
+        del data["protocol"]["generation_telemetry"]
+    else:
+        del data["samples"][0]["chunk_generation_stats"]
+
+    with pytest.raises(ValueError, match="generation_telemetry|chunk_generation_stats"):
+        type(report).from_json(json.dumps(data))
+
+
+@pytest.mark.parametrize(
+    "raw_stats",
+    [
+        1,
+        {"chunk_index": 0},
+        {
+            "chunk_index": 0,
+            "seek_time_us": 0,
+            "prompt_tokens": 0,
+            "observed_rows": 3,
+            "generated_rows": 3,
+            "eos_step": 3,
+            "max_gen_len": 2000,
+            "hit_generation_limit": False,
+            "extra": "rejected",
+        },
+    ],
+)
+def test_report_v2_rejects_noncanonical_chunk_generation_stats(raw_stats):
+    def instrumented_stream(observer):
+        observer(_chunk_stats())
+        yield from _note_stream()
+
+    report = run_benchmark(
+        lambda: _note_stream(),
+        workload=BenchmarkWorkload("fake"),
+        environment=BenchmarkEnvironment("cpu-test"),
+        protocol=BenchmarkProtocol(
+            warmup_runs=0,
+            measured_runs=1,
+            generation_telemetry="selected-output-v1",
+        ),
+        instrumented_event_stream_factory=instrumented_stream,
+        clock_ns=iter((0, 1, 2, 3, 4)).__next__,
+    )
+    data = json.loads(report.to_json())
+    data["samples"][0]["chunk_generation_stats"] = [raw_stats]
+
+    with pytest.raises(ValueError, match="chunk_generation_stats"):
+        type(report).from_json(json.dumps(data))
+
+
+def test_report_v2_rejects_non_positive_wall_time_from_json():
     report = run_benchmark(
         lambda: _note_stream(),
         workload=BenchmarkWorkload("fake"),
@@ -501,7 +925,7 @@ def test_report_v1_rejects_non_positive_wall_time_from_json():
 
 
 @pytest.mark.parametrize("wall_time_ns", [1.5, True, float("inf")])
-def test_report_v1_rejects_non_integer_wall_time_from_json(wall_time_ns):
+def test_report_v2_rejects_non_integer_wall_time_from_json(wall_time_ns):
     report = run_benchmark(
         lambda: _note_stream(),
         workload=BenchmarkWorkload("fake"),
@@ -526,6 +950,7 @@ def _completed_report(
     stream_digest: str = "stream-a",
     note_digest: str = "notes-a",
     source: dict | None = None,
+    generation_telemetry: str = "none",
 ):
     samples = tuple(
         BenchmarkSample(
@@ -533,10 +958,19 @@ def _completed_report(
             wall_time_ns=wall_time,
             first_progress_ns=10,
             first_note_ns=20,
-            progress_milestones=(),
-            event_counts=EventCounts(note_start=1, note_end=1, progress=0),
+            progress_milestones=(
+                (ProgressMilestone(completed=0, total=0, elapsed_ns=10),)
+                if generation_telemetry != "none"
+                else ()
+            ),
+            event_counts=EventCounts(
+                note_start=1,
+                note_end=1,
+                progress=1 if generation_telemetry != "none" else 0,
+            ),
             stream_digest=stream_digest,
             note_digest=note_digest,
+            chunk_generation_stats=(() if generation_telemetry != "none" else None),
         )
         for index, wall_time in enumerate(wall_times)
     )
@@ -547,6 +981,7 @@ def _completed_report(
             scope=scope,
             warmup_runs=1,
             measured_runs=len(samples),
+            generation_telemetry=generation_telemetry,
         ),
         samples=samples,
         source=source or {},
@@ -582,6 +1017,29 @@ def test_golden_gate_rejects_a_different_protocol():
     candidate = _completed_report(scope="different-timing-boundary")
 
     result = compare_reports(candidate, golden, GoldenPolicy(5.0))
+
+    assert result == GateResult(
+        GateStatus.INCOMPATIBLE,
+        reasons=("protocol_mismatch",),
+    )
+
+
+def test_golden_gate_keeps_generation_telemetry_separate_from_v1_golden():
+    legacy_data = json.loads(_completed_report().to_json())
+    legacy_data["schema_version"] = 1
+    del legacy_data["protocol"]["generation_telemetry"]
+    for sample in legacy_data["samples"]:
+        del sample["chunk_generation_stats"]
+    legacy_golden = BenchmarkReport.from_json(json.dumps(legacy_data))
+    instrumented_candidate = _completed_report(
+        generation_telemetry="selected-output-v1"
+    )
+
+    result = compare_reports(
+        instrumented_candidate,
+        legacy_golden,
+        GoldenPolicy(5.0),
+    )
 
     assert result == GateResult(
         GateStatus.INCOMPATIBLE,

@@ -2,6 +2,7 @@
 
 import json
 import os
+import types
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from muscriptor.benchmark import (
     EventCounts,
 )
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
+from muscriptor.generation_telemetry import ChunkGenerationStats
 
 
 class _FakeModel:
@@ -48,6 +50,46 @@ class _MutatingModel(_FakeModel):
     def transcribe(self, audio, **kwargs):
         type(self).audio_path.write_bytes(b"changed while running")
         yield from super().transcribe(audio, **kwargs)
+
+
+class _NoEosModel(_FakeModel):
+    def transcribe(self, _audio, **kwargs):
+        type(self).transcribe_kwargs = kwargs
+        if False:
+            yield
+        raise RuntimeError("chunk 0 did not emit EOS within 2000 tokens")
+
+
+class _TelemetryFakeModel(_FakeModel):
+    prepared_kwargs: list[dict] = []
+
+    def transcribe(self, _audio, **_kwargs):
+        pytest.fail("telemetry must use canonical prepared audio directly")
+
+    def _transcribe_prepared(self, wav, **kwargs):
+        assert wav.shape == (1, 16_000)
+        observer = kwargs.pop("_generation_observer")
+        type(self).prepared_kwargs.append(kwargs)
+        observer(
+            ChunkGenerationStats(
+                chunk_index=0,
+                seek_time_us=0,
+                prompt_tokens=0,
+                observed_rows=3,
+                generated_rows=3,
+                eos_step=3,
+                max_gen_len=2000,
+                hit_generation_limit=False,
+            )
+        )
+        start = NoteStartEvent(60, 0.1, 7, "piano")
+        yield ProgressEvent(0, 1)
+        yield start
+        yield NoteEndEvent(0.4, start)
+        yield ProgressEvent(1, 1)
+
+    def _generate_token_stream(self, *_args, **_kwargs):
+        raise AssertionError("the fake prepared seam does not decode tokens")
 
 
 def _run_args(audio: Path, weights: Path, output: Path) -> list[str]:
@@ -174,7 +216,11 @@ def test_run_writes_a_report_without_real_inference(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(output.read_text())
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert payload["protocol"]["generation_telemetry"] == "none"
+    assert all(
+        sample["chunk_generation_stats"] is None for sample in payload["samples"]
+    )
     assert payload["environment"]["name"] == "test-cpu"
     assert payload["workload"]["parameters"]["audio"]["num_samples"] == 16_000
     assert payload["workload"]["parameters"]["model"]["config"] == {
@@ -200,6 +246,208 @@ def test_run_writes_a_report_without_real_inference(monkeypatch, tmp_path):
         "profile": False,
         "log_progress": False,
     }
+
+
+def test_run_forwards_canonical_instruments_and_allow_no_eos_to_the_workload(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _FakeModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+    monkeypatch.setattr(benchmark_cli, "_source_metadata", lambda: {})
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [
+            *_run_args(audio, weights, output),
+            "--instruments",
+            "drums, chromatic_percussion, orchestra_hit",
+            "--allow-no-eos",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text())
+    assert (
+        _FakeModel.transcribe_kwargs,
+        payload["workload"]["parameters"]["transcribe"],
+    ) == (
+        {
+            **benchmark_cli._TRANSCRIBE_PARAMETERS,
+            "instruments": [
+                "drums",
+                "chromatic_percussion",
+                "orchestra_hit",
+            ],
+            "no_eos_is_ok": True,
+        },
+    ) * 2
+
+
+def test_generation_telemetry_rejects_fake_or_overridden_model_implementations(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    output.write_text("keep existing report")
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _FakeModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [
+            *_run_args(audio, weights, output),
+            "--generation-telemetry",
+            "--force",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "generation-telemetry" in result.output
+    assert "TranscriptionModel" in result.output
+    assert output.read_text() == "keep existing report"
+
+
+def test_strict_eos_failure_keeps_an_existing_force_target(monkeypatch, tmp_path):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    output.write_text("keep existing report")
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _NoEosModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [*_run_args(audio, weights, output), "--force"],
+    )
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError)
+    assert _NoEosModel.transcribe_kwargs["no_eos_is_ok"] is False
+    assert output.read_text() == "keep existing report"
+
+
+@pytest.mark.parametrize(
+    ("override_scope", "method_name"),
+    [
+        (scope, method_name)
+        for scope in ("class", "instance")
+        for method_name in (
+            "transcribe",
+            "_transcribe_prepared",
+            "_generate_token_stream",
+        )
+    ],
+)
+def test_generation_telemetry_detects_class_and_instance_method_overrides(
+    override_scope,
+    method_name,
+):
+    def override(self, *_args, **_kwargs):
+        return None
+
+    if override_scope == "class":
+        model_type = type(
+            "OverriddenTranscriptionModel",
+            (benchmark_cli.TranscriptionModel,),
+            {method_name: override},
+        )
+        model = object.__new__(model_type)
+    else:
+        model = object.__new__(benchmark_cli.TranscriptionModel)
+        setattr(model, method_name, types.MethodType(override, model))
+
+    with pytest.raises(typer.BadParameter, match=method_name):
+        benchmark_cli._require_base_generation_telemetry_model(model)
+
+
+def test_generation_telemetry_uses_prepared_audio_and_records_v2_chunk_stats(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "audio.wav"
+    weights = tmp_path / "model.safetensors"
+    output = tmp_path / "report.json"
+    audio.write_bytes(b"audio bytes")
+    weights.write_bytes(b"weight bytes")
+    _TelemetryFakeModel.prepared_kwargs = []
+    monkeypatch.setattr(benchmark_cli, "TranscriptionModel", _TelemetryFakeModel)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "_require_base_generation_telemetry_model",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(
+        benchmark_cli,
+        "load_audio",
+        lambda _path: torch.zeros(1, 16_000),
+    )
+    monkeypatch.setattr(benchmark_cli, "_source_metadata", lambda: {})
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [
+            *_run_args(audio, weights, output),
+            "--generation-telemetry",
+            "--allow-no-eos",
+            "--instruments",
+            "drums,chromatic_percussion,orchestra_hit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text())
+    expected_parameters = {
+        **benchmark_cli._TRANSCRIBE_PARAMETERS,
+        "instruments": ["drums", "chromatic_percussion", "orchestra_hit"],
+        "no_eos_is_ok": True,
+    }
+    assert (
+        payload["protocol"]["generation_telemetry"],
+        [sample["chunk_generation_stats"] for sample in payload["samples"]],
+        _TelemetryFakeModel.prepared_kwargs,
+    ) == (
+        "selected-output-v1",
+        [
+            [
+                {
+                    "chunk_index": 0,
+                    "seek_time_us": 0,
+                    "prompt_tokens": 0,
+                    "observed_rows": 3,
+                    "generated_rows": 3,
+                    "eos_step": 3,
+                    "max_gen_len": 2000,
+                    "hit_generation_limit": False,
+                }
+            ]
+        ]
+        * 2,
+        [expected_parameters] * 3,
+    )
 
 
 def test_run_preserves_hf_snapshot_paths_for_adjacent_symlinked_config(

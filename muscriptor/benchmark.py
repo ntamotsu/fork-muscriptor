@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
+from muscriptor.generation_telemetry import ChunkGenerationStats
 
 
 TranscriptionEvent = NoteStartEvent | NoteEndEvent | ProgressEvent
@@ -42,10 +43,17 @@ class BenchmarkProtocol:
     scope: str = "model-loaded-audio-predecoded-on-device"
     warmup_runs: int = 1
     measured_runs: int = 5
+    generation_telemetry: str = "none"
 
     def __post_init__(self) -> None:
         _require_integer("warmup_runs", self.warmup_runs, minimum=0)
         _require_integer("measured_runs", self.measured_runs, minimum=1)
+        if not isinstance(self.generation_telemetry, str) or (
+            self.generation_telemetry not in {"none", "selected-output-v1"}
+        ):
+            raise ValueError(
+                "generation_telemetry must be 'none' or 'selected-output-v1'"
+            )
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,7 @@ class BenchmarkSample:
     event_counts: EventCounts
     stream_digest: str
     note_digest: str
+    chunk_generation_stats: tuple[ChunkGenerationStats, ...] | None = None
 
     def __post_init__(self) -> None:
         _require_integer("index", self.index, minimum=0)
@@ -101,6 +110,22 @@ class BenchmarkSample:
             for milestone in self.progress_milestones
         ):
             raise ValueError("progress milestone must not exceed wall_time_ns")
+        if self.chunk_generation_stats is not None:
+            if type(self.chunk_generation_stats) is not tuple or not all(
+                isinstance(stats, ChunkGenerationStats)
+                for stats in self.chunk_generation_stats
+            ):
+                raise ValueError(
+                    "chunk_generation_stats must be a tuple of ChunkGenerationStats"
+                )
+            chunk_indexes = tuple(
+                stats.chunk_index for stats in self.chunk_generation_stats
+            )
+            if chunk_indexes != tuple(range(len(chunk_indexes))):
+                raise ValueError(
+                    "chunk_generation_stats chunk_index values must be contiguous "
+                    "and start at zero"
+                )
 
 
 @dataclass(frozen=True)
@@ -111,7 +136,7 @@ class BenchmarkReport:
     samples: tuple[BenchmarkSample, ...]
     # commit、dirty状態、日時は来歴であり、比較互換性の条件には含めない。
     source: Mapping[str, JSONValue] = field(default_factory=dict)
-    schema_version: int = field(default=1, init=False)
+    schema_version: int = field(default=2, init=False)
 
     def __post_init__(self) -> None:
         if len(self.samples) != self.protocol.measured_runs:
@@ -122,6 +147,35 @@ class BenchmarkReport:
             range(len(self.samples))
         ):
             raise ValueError("sample indexes must be contiguous and start at zero")
+        telemetry_is_enabled = self.protocol.generation_telemetry != "none"
+        if any(
+            (sample.chunk_generation_stats is not None) != telemetry_is_enabled
+            for sample in self.samples
+        ):
+            raise ValueError(
+                "sample generation telemetry must match protocol.generation_telemetry"
+            )
+        if telemetry_is_enabled:
+            for sample in self.samples:
+                assert sample.chunk_generation_stats is not None
+                if not sample.progress_milestones:
+                    raise ValueError(
+                        "generation telemetry requires progress milestones"
+                    )
+                progress_totals = {
+                    milestone.total for milestone in sample.progress_milestones
+                }
+                if len(progress_totals) != 1:
+                    raise ValueError(
+                        "generation telemetry requires one consistent progress total"
+                    )
+                progress_total = next(iter(progress_totals))
+                if sample.progress_milestones[-1].completed != progress_total:
+                    raise ValueError("generation telemetry requires terminal progress")
+                if len(sample.chunk_generation_stats) != progress_total:
+                    raise ValueError(
+                        "chunk_generation_stats count must match progress total"
+                    )
 
     @property
     def median_wall_time_ns(self) -> float:
@@ -155,7 +209,8 @@ class BenchmarkReport:
         data = json.loads(payload, parse_constant=_reject_non_finite_json)
         if not isinstance(data, dict):
             raise ValueError("Benchmark report must be a JSON object")
-        if data.get("schema_version") != 1:
+        schema_version = data.get("schema_version")
+        if type(schema_version) is not int or schema_version not in (1, 2):
             raise ValueError(
                 f"Unsupported benchmark schema_version: {data.get('schema_version')!r}"
             )
@@ -163,6 +218,10 @@ class BenchmarkReport:
         workload = _mapping(data, "workload")
         environment = _mapping(data, "environment")
         protocol = _mapping(data, "protocol")
+        if schema_version == 1 and "generation_telemetry" in protocol:
+            raise ValueError(
+                "Schema v1 benchmark report must not contain generation_telemetry"
+            )
         sample_data = data.get("samples")
         if not isinstance(sample_data, list):
             raise ValueError("Benchmark report field 'samples' must be a list")
@@ -175,6 +234,19 @@ class BenchmarkReport:
             raw_milestones = raw_sample.get("progress_milestones")
             if not isinstance(raw_milestones, list):
                 raise ValueError("Sample progress_milestones must be a list")
+            if schema_version == 1 and "chunk_generation_stats" in raw_sample:
+                raise ValueError(
+                    "Schema v1 benchmark sample must not contain chunk_generation_stats"
+                )
+            raw_generation_stats = (
+                None
+                if schema_version == 1
+                else _required(raw_sample, "chunk_generation_stats")
+            )
+            if raw_generation_stats is not None and not isinstance(
+                raw_generation_stats, list
+            ):
+                raise ValueError("Sample chunk_generation_stats must be a list or null")
             samples.append(
                 BenchmarkSample(
                     index=raw_sample["index"],
@@ -196,6 +268,14 @@ class BenchmarkReport:
                     ),
                     stream_digest=raw_sample["stream_digest"],
                     note_digest=raw_sample["note_digest"],
+                    chunk_generation_stats=(
+                        None
+                        if raw_generation_stats is None
+                        else tuple(
+                            _chunk_generation_stats_from_json(raw_stats)
+                            for raw_stats in raw_generation_stats
+                        )
+                    ),
                 )
             )
 
@@ -212,6 +292,11 @@ class BenchmarkReport:
                 scope=protocol["scope"],
                 warmup_runs=protocol["warmup_runs"],
                 measured_runs=protocol["measured_runs"],
+                generation_telemetry=(
+                    "none"
+                    if schema_version == 1
+                    else _required(protocol, "generation_telemetry")
+                ),
             ),
             samples=tuple(samples),
             source=_mapping(data, "source"),
@@ -338,6 +423,47 @@ def _mapping(container: Mapping[str, object], key: str) -> dict[str, JSONValue]:
     return value
 
 
+def _required(container: Mapping[str, object], key: str) -> object:
+    if key not in container:
+        raise ValueError(f"Benchmark report field {key!r} is required")
+    return container[key]
+
+
+_CHUNK_GENERATION_STATS_FIELDS = {
+    "chunk_index",
+    "seek_time_us",
+    "prompt_tokens",
+    "observed_rows",
+    "generated_rows",
+    "eos_step",
+    "max_gen_len",
+    "hit_generation_limit",
+}
+
+
+def _chunk_generation_stats_from_json(raw_stats: object) -> ChunkGenerationStats:
+    if not isinstance(raw_stats, dict) or set(raw_stats) != (
+        _CHUNK_GENERATION_STATS_FIELDS
+    ):
+        raise ValueError(
+            "Every chunk_generation_stats entry must be a canonical JSON object"
+        )
+    try:
+        return ChunkGenerationStats(**raw_stats)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid chunk_generation_stats entry: {error}") from error
+
+
+def _close_stream(iterator: object, stream: object) -> None:
+    close_iterator = getattr(iterator, "close", None)
+    if callable(close_iterator):
+        close_iterator()
+    if stream is not iterator:
+        close_stream = getattr(stream, "close", None)
+        if callable(close_stream):
+            close_stream()
+
+
 def run_benchmark(
     event_stream_factory: Callable[[], Iterable[TranscriptionEvent]],
     *,
@@ -347,14 +473,38 @@ def run_benchmark(
     source: Mapping[str, JSONValue] | None = None,
     clock_ns: Callable[[], int] = time.perf_counter_ns,
     synchronize: Callable[[], None] = _noop,
+    instrumented_event_stream_factory: Callable[
+        [Callable[[ChunkGenerationStats], None]], Iterable[TranscriptionEvent]
+    ]
+    | None = None,
 ) -> BenchmarkReport:
     """遅延イベントstreamに対してwarmupと計測runを実行する。"""
+    factory_is_instrumented = instrumented_event_stream_factory is not None
+    telemetry_is_enabled = protocol.generation_telemetry != "none"
+    if factory_is_instrumented != telemetry_is_enabled:
+        raise ValueError(
+            "instrumented_event_stream_factory must match protocol.generation_telemetry"
+        )
+
     for _ in range(protocol.warmup_runs):
         synchronize()
-        for _event in event_stream_factory():
-            pass
+        warmup_stats: list[ChunkGenerationStats] = []
+        stream = (
+            event_stream_factory()
+            if instrumented_event_stream_factory is None
+            else instrumented_event_stream_factory(warmup_stats.append)
+        )
+        iterator = iter(stream)
+        try:
+            for _event in iterator:
+                pass
+        finally:
+            _close_stream(iterator, stream)
+            iterator = None
+            stream = None
         # 最後のwarmup eventも解放してから同期し、解放に伴う処理を完了させる。
         _event = None
+        warmup_stats.clear()
         synchronize()
 
     samples: list[BenchmarkSample] = []
@@ -369,28 +519,43 @@ def run_benchmark(
         note_start_count = 0
         note_end_count = 0
         progress_count = 0
+        chunk_generation_stats: list[ChunkGenerationStats] | None = (
+            [] if instrumented_event_stream_factory is not None else None
+        )
         synchronize()
         started_ns = clock_ns()
 
-        for event in event_stream_factory():
-            events.append(event)
-            if isinstance(event, ProgressEvent):
-                elapsed_ns = clock_ns() - started_ns
-                if first_progress_ns is None:
-                    first_progress_ns = elapsed_ns
-                milestones.append(
-                    ProgressMilestone(event.completed, event.total, elapsed_ns)
-                )
-                progress_count += 1
-            elif isinstance(event, NoteStartEvent):
-                if first_note_ns is None:
-                    first_note_ns = clock_ns() - started_ns
-                note_start_count += 1
-            elif isinstance(event, NoteEndEvent):
-                note_end_count += 1
-            else:
-                raise TypeError(f"Unsupported transcription event: {type(event)!r}")
+        stream = (
+            event_stream_factory()
+            if instrumented_event_stream_factory is None
+            else instrumented_event_stream_factory(chunk_generation_stats.append)
+        )
+        iterator = iter(stream)
+        try:
+            for event in iterator:
+                events.append(event)
+                if isinstance(event, ProgressEvent):
+                    elapsed_ns = clock_ns() - started_ns
+                    if first_progress_ns is None:
+                        first_progress_ns = elapsed_ns
+                    milestones.append(
+                        ProgressMilestone(event.completed, event.total, elapsed_ns)
+                    )
+                    progress_count += 1
+                elif isinstance(event, NoteStartEvent):
+                    if first_note_ns is None:
+                        first_note_ns = clock_ns() - started_ns
+                    note_start_count += 1
+                elif isinstance(event, NoteEndEvent):
+                    note_end_count += 1
+                else:
+                    raise TypeError(f"Unsupported transcription event: {type(event)!r}")
+        finally:
+            _close_stream(iterator, stream)
+            iterator = None
+            stream = None
 
+        # iteratorの終了処理も計測対象に含め、終端同期より前に完了させる。
         synchronize()
         wall_time_ns = clock_ns() - started_ns
         samples.append(
@@ -407,6 +572,11 @@ def run_benchmark(
                 ),
                 stream_digest=canonical_stream_digest(events),
                 note_digest=canonical_note_digest(events),
+                chunk_generation_stats=(
+                    None
+                    if chunk_generation_stats is None
+                    else tuple(chunk_generation_stats)
+                ),
             )
         )
     return BenchmarkReport(
