@@ -7,14 +7,20 @@ out *as soon as that chunk finishes* — before the rest of the batch is even
 generated.
 """
 
-from types import SimpleNamespace
+import copy
+import pickle
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Lock
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from muscriptor.events import ChunkBoundary, ProgressEvent
 from muscriptor.transcription_model import TranscriptionModel
-from muscriptor.utils.beats import BeatDetectionError
+from muscriptor.utils.beats import BeatDetectionError, _LazyAudio2Beats
 
 EOS = 99
 
@@ -182,14 +188,36 @@ class _FakeAudio(TranscriptionModel):
     _load_wav = staticmethod(lambda tensor, sr: tensor)
 
     def __init__(self):
-        pass
+        super().__init__(
+            model=object(),
+            tokenizer=SimpleNamespace(group_program_map={}),
+            device=torch.device("cpu"),
+        )
+
+
+def _install_fake_beat_this(monkeypatch, audio2beats):
+    beat_this = ModuleType("beat_this")
+    inference = ModuleType("beat_this.inference")
+    inference.Audio2Beats = audio2beats
+    beat_this.inference = inference
+    monkeypatch.setitem(sys.modules, "beat_this", beat_this)
+    monkeypatch.setitem(sys.modules, "beat_this.inference", inference)
+
+
+def _tempo_model():
+    return TranscriptionModel(
+        model=object(),
+        tokenizer=SimpleNamespace(group_program_map={}),
+        device=torch.device("cpu"),
+    )
+
+
+def _fake_beat_predictions():
+    beats = [index * 0.5 for index in range(8)]
+    return beats, beats[::4]
 
 
 class _MinimalTranscriber(TranscriptionModel):
-    _device = torch.device("cpu")
-    _tokenizer = SimpleNamespace(_vocab=[], frame_rate=100)
-    _instrument_for_program = staticmethod(lambda _program: "piano")
-
     @staticmethod
     def _resolve_batch_size(_batch_size, _prelude_forcing):
         return 1
@@ -203,6 +231,15 @@ class _MinimalTranscriber(TranscriptionModel):
         return [object()]
 
     def __init__(self):
+        super().__init__(
+            model=object(),
+            tokenizer=SimpleNamespace(
+                group_program_map={},
+                _vocab=[],
+                frame_rate=100,
+            ),
+            device=torch.device("cpu"),
+        )
         self.profile_seen = None
 
     def _generate_token_stream(self, *_args, profile=False, **_kwargs):
@@ -275,7 +312,7 @@ def test_midi_prepares_audio_once_and_shares_the_same_tensor(monkeypatch):
     model = _PreparedAudioRecorder()
     beat_wavs = []
 
-    def fake_detect_grid(wav, _sample_rate):
+    def fake_detect_grid(wav, _sample_rate, **_kwargs):
         beat_wavs.append(wav)
         return "beat-grid"
 
@@ -337,3 +374,197 @@ def test_detect_tempo_modes(monkeypatch):
     # true: the caller wanted to know.
     with pytest.raises(BeatDetectionError):
         model.detect_beat_grid_for((None, None), True)
+
+
+def test_tempo_detector_is_lazily_reused_by_one_model(monkeypatch):
+    constructor_calls = []
+    inference_calls = []
+
+    class FakeAudio2Beats:
+        def __init__(self, *, checkpoint_path, device, dbn):
+            constructor_calls.append((checkpoint_path, device, dbn))
+
+        def __call__(self, signal, sample_rate):
+            inference_calls.append((signal, sample_rate))
+            return _fake_beat_predictions()
+
+    _install_fake_beat_this(monkeypatch, FakeAudio2Beats)
+    model = _tempo_model()
+    wav = torch.zeros(1, 16_000)
+
+    model.detect_beat_grid_for((wav, 16_000), True)
+    model.detect_beat_grid_for((wav, 16_000), True)
+
+    assert constructor_calls == [("final0", "cpu", False)]
+    assert len(inference_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "clone",
+    (copy.deepcopy, lambda value: pickle.loads(pickle.dumps(value))),
+    ids=("deepcopy", "pickle"),
+)
+def test_lazy_tempo_detector_serialization_restores_an_empty_cpu_cache(
+    monkeypatch,
+    clone,
+):
+    constructor_configs = []
+
+    class FakeAudio2Beats:
+        def __init__(self, **kwargs):
+            constructor_configs.append((kwargs["checkpoint_path"], kwargs["device"]))
+
+        def __call__(self, _signal, _sample_rate):
+            return _fake_beat_predictions()
+
+    _install_fake_beat_this(monkeypatch, FakeAudio2Beats)
+    detector = _LazyAudio2Beats(checkpoint="custom", device="cpu")
+    signal = torch.zeros(16_000).numpy()
+    detector(signal, 16_000)
+
+    restored = clone(detector)
+    assert restored._detector is None
+    assert restored._lock is not detector._lock
+    restored(signal, 16_000)
+
+    assert constructor_configs == [("custom", "cpu"), ("custom", "cpu")]
+
+
+def test_tempo_detector_constructor_failure_is_retried(monkeypatch):
+    constructor_calls = 0
+    inference_calls = 0
+
+    class FakeAudio2Beats:
+        def __init__(self, **_kwargs):
+            nonlocal constructor_calls
+            constructor_calls += 1
+            if constructor_calls == 1:
+                raise RuntimeError("constructor failed")
+
+        def __call__(self, _signal, _sample_rate):
+            nonlocal inference_calls
+            inference_calls += 1
+            return _fake_beat_predictions()
+
+    _install_fake_beat_this(monkeypatch, FakeAudio2Beats)
+    model = _tempo_model()
+    audio = (torch.zeros(1, 16_000), 16_000)
+
+    with pytest.raises(RuntimeError, match="constructor failed"):
+        model.detect_beat_grid_for(audio, True)
+    model.detect_beat_grid_for(audio, True)
+    model.detect_beat_grid_for(audio, True)
+
+    assert (constructor_calls, inference_calls) == (2, 2)
+
+
+def test_tempo_detector_is_kept_after_an_input_specific_failure(monkeypatch):
+    constructor_calls = 0
+    inference_calls = 0
+
+    class FakeAudio2Beats:
+        def __init__(self, **_kwargs):
+            nonlocal constructor_calls
+            constructor_calls += 1
+
+        def __call__(self, _signal, _sample_rate):
+            nonlocal inference_calls
+            inference_calls += 1
+            if inference_calls == 1:
+                raise BeatDetectionError("no beat for this input")
+            return _fake_beat_predictions()
+
+    _install_fake_beat_this(monkeypatch, FakeAudio2Beats)
+    model = _tempo_model()
+    audio = (torch.zeros(1, 16_000), 16_000)
+
+    with pytest.raises(BeatDetectionError, match="this input"):
+        model.detect_beat_grid_for(audio, True)
+    model.detect_beat_grid_for(audio, True)
+
+    assert (constructor_calls, inference_calls) == (1, 2)
+
+
+def test_tempo_detector_is_not_shared_between_models(monkeypatch):
+    detectors = []
+
+    class FakeAudio2Beats:
+        def __init__(self, **_kwargs):
+            detectors.append(self)
+
+        def __call__(self, _signal, _sample_rate):
+            return _fake_beat_predictions()
+
+    _install_fake_beat_this(monkeypatch, FakeAudio2Beats)
+    audio = (torch.zeros(1, 16_000), 16_000)
+
+    _tempo_model().detect_beat_grid_for(audio, True)
+    _tempo_model().detect_beat_grid_for(audio, True)
+
+    assert len(detectors) == 2
+    assert detectors[0] is not detectors[1]
+
+
+def test_tempo_detector_is_not_built_when_disabled_or_audio_is_too_short(monkeypatch):
+    constructor_calls = []
+
+    class FakeAudio2Beats:
+        def __init__(self, **_kwargs):
+            constructor_calls.append(True)
+
+    _install_fake_beat_this(monkeypatch, FakeAudio2Beats)
+    model = _tempo_model()
+
+    assert model.detect_beat_grid_for((torch.zeros(1, 16_000), 16_000), False) is None
+    with pytest.raises(BeatDetectionError, match="too short"):
+        model.detect_beat_grid_for((torch.zeros(1, 15_999), 16_000), True)
+
+    assert constructor_calls == []
+
+
+def test_tempo_detector_concurrent_first_use_builds_once_and_serializes_inference(
+    monkeypatch,
+):
+    workers = 8
+    start = Barrier(workers)
+    state_lock = Lock()
+    constructor_calls = 0
+    inference_calls = 0
+    active_inferences = 0
+    max_active_inferences = 0
+
+    class FakeAudio2Beats:
+        def __init__(self, **_kwargs):
+            nonlocal constructor_calls
+            time.sleep(0.01)
+            with state_lock:
+                constructor_calls += 1
+
+        def __call__(self, _signal, _sample_rate):
+            nonlocal inference_calls, active_inferences, max_active_inferences
+            with state_lock:
+                inference_calls += 1
+                active_inferences += 1
+                max_active_inferences = max(max_active_inferences, active_inferences)
+            time.sleep(0.01)
+            with state_lock:
+                active_inferences -= 1
+            return _fake_beat_predictions()
+
+    _install_fake_beat_this(monkeypatch, FakeAudio2Beats)
+    model = _tempo_model()
+    audio = (torch.zeros(1, 16_000), 16_000)
+
+    def detect(_index):
+        start.wait(timeout=5)
+        return model.detect_beat_grid_for(audio, True)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        grids = list(pool.map(detect, range(workers)))
+
+    assert len(grids) == workers
+    assert (constructor_calls, inference_calls, max_active_inferences) == (
+        1,
+        workers,
+        1,
+    )

@@ -3,7 +3,8 @@
 import dataclasses
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from threading import Lock
 from typing import Literal
 
 import numpy as np
@@ -20,6 +21,8 @@ MAX_TEMPO_RESIDUAL = 0.05
 MIN_METER_AGREEMENT = 0.9
 
 MIN_BEATS = 8
+_DEFAULT_CHECKPOINT = "final0"
+_DEFAULT_DEVICE = "cpu"
 
 # Marker text prefix recording how far notes were delayed to align bar lines,
 # so `/auralize` can line the synthesis back up with the original audio.
@@ -34,7 +37,7 @@ ONSET_SUBDIVISIONS = (1, 2, 3, 4, 6, 8, 12, 16, 24)
 # are above 0.5
 MIN_ONSET_CONCENTRATION = 0.5
 
-# |R| for n random angles is about 1/sqrt(n). With MIN_ONSETS = 40 the chance of 
+# |R| for n random angles is about 1/sqrt(n). With MIN_ONSETS = 40 the chance of
 # passing the bar with a random distribution is about 1 in 5,000.
 MIN_ONSETS = 40
 
@@ -58,6 +61,46 @@ class BeatDetectionError(RuntimeError):
 # try (the escape hatch for songs the detector gets wrong), and "best-effort"
 # warns and falls back to the placeholder tempo.
 TempoDetection = bool | Literal["best-effort"]
+_BeatDetector = Callable[[np.ndarray, int], tuple[object, object]]
+
+
+class _LazyAudio2Beats:
+    """beat_thisのmodelを最初の推論時に構築し、直列に再利用する。"""
+
+    def __init__(
+        self,
+        checkpoint: str = _DEFAULT_CHECKPOINT,
+        device: str = _DEFAULT_DEVICE,
+    ) -> None:
+        self._checkpoint = checkpoint
+        self._device = device
+        self._detector: _BeatDetector | None = None
+        self._lock = Lock()
+
+    def __getstate__(self) -> dict[str, str]:
+        # 外部modelとthread lockは直列化せず、復元後にlazy再構築する。
+        return {"checkpoint": self._checkpoint, "device": self._device}
+
+    def __setstate__(self, state: dict[str, str]) -> None:
+        self.__init__(checkpoint=state["checkpoint"], device=state["device"])
+
+    def __call__(self, signal: np.ndarray, sample_rate: int) -> tuple[object, object]:
+        with self._lock:
+            detector = self._detector
+            if detector is None:
+                # beat_thisは重いoptional dependencyなので、実際に必要になるまで
+                # importしない。
+                from beat_this.inference import Audio2Beats
+
+                detector = Audio2Beats(
+                    checkpoint_path=self._checkpoint,
+                    device=self._device,
+                    dbn=False,
+                )
+                self._detector = detector
+            # rotary_embedding_torchはforward中にcacheを更新するので、共有する
+            # detectorの呼び出し全体を同じlockで直列化する。
+            return detector(signal, sample_rate)
 
 
 def read_bar_offset(midi) -> float:
@@ -301,7 +344,12 @@ def infer_beats_per_bar(
 
 
 def detect_grid(
-    wav: torch.Tensor, sr: int, checkpoint: str = "final0", device: str = "cpu"
+    wav: torch.Tensor,
+    sr: int,
+    checkpoint: str = _DEFAULT_CHECKPOINT,
+    device: str = _DEFAULT_DEVICE,
+    *,
+    detector: _BeatDetector | None = None,
 ) -> BeatGrid:
     """Detect a constant-tempo beat grid.
 
@@ -312,14 +360,21 @@ def detect_grid(
             model emits spurious beats before the first downbeat, which shifts
             the bar offset by a beat or two.
         device: Torch device for the beat model.
+        detector: 構築済みmodelを再利用するときの内部用callable。指定時は
+            detector自身が構成を所有するため、checkpointとdeviceは既定値のみ可。
 
-    Raises BeatDetectionError when the audio is too short or the beats do not
-    fit a constant tempo. An unclear meter is not fatal: the BeatGrid comes back
-    with beats_per_bar=None, since tempo alone is worth writing.
+    Raises:
+        BeatDetectionError: 音声が短すぎるか、一定tempoのgridを得られない場合。
+            meterだけが不明な場合は例外にせず、beats_per_bar=Noneで返す。
+        ValueError: detectorと同時に非defaultのcheckpoint/deviceを指定した場合。
     """
-    # Imported here, not at module scope: beat_this pulls in torchaudio and soxr,
-    # which would slow every CLI invocation that never transcribes anything.
-    from beat_this.inference import Audio2Beats
+    if detector is not None and (
+        checkpoint != _DEFAULT_CHECKPOINT or device != _DEFAULT_DEVICE
+    ):
+        raise ValueError(
+            "checkpoint and device must use their defaults when a supplied detector "
+            "owns that configuration"
+        )
 
     # This triggers an error in beat_this so report as BeatDetectionError directly
     min_duration_s = 1.0
@@ -329,11 +384,19 @@ def detect_grid(
         )
 
     signal = wav.mean(dim=0).detach().cpu().numpy()  # beat_this wants mono, 1-D
+    if detector is None:
+        # Imported here, not at module scope: beat_this pulls in torchaudio and soxr,
+        # which would slow every CLI invocation that never detects a tempo.
+        from beat_this.inference import Audio2Beats
+
+        detector = Audio2Beats(
+            checkpoint_path=checkpoint,
+            device=device,
+            dbn=False,
+        )
     # Returns (beats, downbeats) despite beat_this's own File2File unpacking
     # them the other way round.
-    beats, downbeats = Audio2Beats(
-        checkpoint_path=checkpoint, device=device, dbn=False
-    )(signal, sr)
+    beats, downbeats = detector(signal, sr)
 
     beats = np.asarray(beats, dtype=float)
     downbeats = np.asarray(downbeats, dtype=float)

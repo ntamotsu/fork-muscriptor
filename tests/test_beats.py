@@ -4,16 +4,22 @@ All synthetic: the maths is exercised without beat_this or a checkpoint, since
 only detect_grid touches the model.
 """
 
+import builtins
 import dataclasses
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
+import torch
 
 from muscriptor.utils.beats import (
     BAR_OFFSET_MARKER,
     MAX_ONSET_DELAY_S,
     MAX_TEMPO_RESIDUAL,
     MIN_ONSETS,
+    BeatDetectionError,
     BeatGrid,
+    detect_grid,
     estimate_onset_delay,
     fit_tempo,
     get_onsets_phase,
@@ -45,6 +51,81 @@ def _onsets(beats, subdivision=4, delay=0.0):
     """Onsets on every 1/subdivision of `beats`, `delay` seconds late."""
     fine = np.linspace(beats[0], beats[-1], (len(beats) - 1) * subdivision + 1)
     return fine + delay
+
+
+def test_short_audio_is_rejected_without_importing_beat_this(monkeypatch):
+    imported = []
+    real_import = builtins.__import__
+
+    def tracked_import(name, *args, **kwargs):
+        if name == "beat_this.inference":
+            imported.append(name)
+            return SimpleNamespace(Audio2Beats=object)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", tracked_import)
+
+    with pytest.raises(BeatDetectionError, match="too short"):
+        detect_grid(torch.zeros(1, 15_999), 16_000)
+
+    assert imported == []
+
+
+def test_detect_grid_keeps_four_positional_arguments(monkeypatch):
+    constructor_calls = []
+    signals = []
+
+    class FakeAudio2Beats:
+        def __init__(self, *, checkpoint_path, device, dbn):
+            constructor_calls.append((checkpoint_path, device, dbn))
+
+        def __call__(self, signal, sample_rate):
+            assert isinstance(signal, np.ndarray)
+            assert sample_rate == 16_000
+            signals.append(signal)
+            beats = [index * 0.5 for index in range(8)]
+            return beats, beats[::4]
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "beat_this.inference":
+            return SimpleNamespace(Audio2Beats=FakeAudio2Beats)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    wav = torch.stack((torch.zeros(16_000), torch.ones(16_000)))
+    detect_grid(wav, 16_000, "custom-checkpoint", "cpu")
+
+    assert constructor_calls == [("custom-checkpoint", "cpu", False)]
+    np.testing.assert_array_equal(signals, [np.full(16_000, 0.5)])
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "device"),
+    (("small0", "cpu"), ("final0", "cuda:0")),
+)
+def test_detect_grid_rejects_configuration_ignored_by_a_supplied_detector(
+    checkpoint,
+    device,
+):
+    detector_calls = []
+
+    def detector(_signal, _sample_rate):
+        detector_calls.append(True)
+        beats = _beats(n=8)
+        return beats, beats[::4]
+
+    with pytest.raises(ValueError, match="supplied detector"):
+        detect_grid(
+            torch.zeros(1, 16_000),
+            16_000,
+            checkpoint,
+            device,
+            detector=detector,
+        )
+    assert detector_calls == []
 
 
 def test_fit_tempo_recovers_tempo():

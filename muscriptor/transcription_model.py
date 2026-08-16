@@ -48,6 +48,7 @@ from muscriptor.utils.beats import (
     BeatDetectionError,
     BeatGrid,
     TempoDetection,
+    _LazyAudio2Beats,
     detect_grid,
 )
 from muscriptor.utils.download import download_companion, download_if_necessary
@@ -254,6 +255,7 @@ class TranscriptionModel:
         self._tokenizer = tokenizer
         self._device = device
         self._instrument_for_program = _build_instrument_for_program(tokenizer)
+        self._beat_detector = _LazyAudio2Beats(checkpoint="final0", device="cpu")
 
     @classmethod
     def load_model(
@@ -678,7 +680,7 @@ class TranscriptionModel:
         if mode is False:
             return None
         try:
-            return detect_grid(wav, _SAMPLE_RATE)
+            return detect_grid(wav, _SAMPLE_RATE, detector=self._beat_detector)
         except BeatDetectionError as e:
             if mode is True:
                 raise
