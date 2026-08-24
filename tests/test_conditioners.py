@@ -1,7 +1,9 @@
 """Tests for muscriptor/modules/conditioners.py — CPU only."""
 
+import pytest
 import torch
 
+import muscriptor.accelerator
 from muscriptor.modules.conditioners import (
     ConditioningAttributes,
     WavCondition,
@@ -88,6 +90,23 @@ def test_mel_conditioner_output_shape():
     assert embed.shape[-1] == 32
     assert embed.shape[0] == 1
     assert mask.shape[0] == 1
+
+
+def test_mel_conditioner_does_not_emit_diagnostics_or_synchronize(monkeypatch, capsys):
+    monkeypatch.setattr(
+        muscriptor.accelerator,
+        "synchronize",
+        lambda: pytest.fail("mel conditioning must not synchronize for diagnostics"),
+    )
+    cond = _make_mel_conditioner()
+    wav = WavCondition(
+        wav=torch.randn(1, 1, 1600),
+        length=torch.tensor([1600]),
+        sample_rate=[16000],
+    )
+
+    cond(cond.tokenize(wav))
+    assert capsys.readouterr() == ("", "")
 
 
 def test_mel_conditioner_mask_dtype():

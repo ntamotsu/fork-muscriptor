@@ -1,5 +1,5 @@
 """CLI tests — checks that `-o -` writes a clean JSONL stream to stdout
-and that all progress/timing chatter goes to stderr.
+and that all progress and diagnostic output goes to stderr.
 
 Patches the model loader with a fake so the test stays hermetic.
 """

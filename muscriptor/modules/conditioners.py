@@ -8,7 +8,6 @@ Contains only the classes needed to run the transcription model:
 - nullify_all_conditions (for CFG at inference)
 """
 
-import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -18,7 +17,6 @@ from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
 
-import muscriptor.accelerator
 from muscriptor.modules.mel_spectrogram import _MelSpectrogram
 from muscriptor.utils.sampling import length_to_mask
 
@@ -161,8 +159,6 @@ class MelSpectrogramConditioner(nn.Module):
     def _mel_embedding(self, x: WavCondition) -> torch.Tensor:
         if x.wav.shape[-1] == 1:
             return torch.zeros(x.wav.shape[0], 1, self.dim, device=self.device)
-        muscriptor.accelerator.synchronize()
-        t0 = time.perf_counter()
         with torch.no_grad():
             wav = x.wav
             if self.normalize_audio:
@@ -175,11 +171,6 @@ class MelSpectrogramConditioner(nn.Module):
                 )
             if self.log_scale:
                 mel = torch.log(mel + self.eps)
-        muscriptor.accelerator.synchronize()
-        print(
-            f"[muscriptor] mel-spec ({wav.shape[0]} × {wav.shape[-1]} samples): "
-            f"{time.perf_counter() - t0:.3f}s"
-        )
         return mel
 
     def forward(self, x: WavCondition) -> ConditionType:

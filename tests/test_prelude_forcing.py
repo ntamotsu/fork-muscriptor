@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import muscriptor.accelerator
 from muscriptor.events import (
     ChunkBoundary,
     NoteEndEvent,
@@ -29,7 +30,7 @@ from muscriptor.events import (
     decode_model_tokens,
 )
 from muscriptor.models.lm import LMModel
-from muscriptor.modules.conditioners import ConditioningProvider
+from muscriptor.modules.conditioners import ConditioningAttributes, ConditioningProvider
 from muscriptor.tokenizer.mt3 import MT3Tokenizer
 from muscriptor.tokenizer.notes import NoteEvent, TieNoteEvent, build_event_vocab
 from muscriptor.transcription_model import TranscriptionModel
@@ -392,6 +393,30 @@ def test_generate_yields_prompt_tokens_first(tiny_model):
     )
     assert tokens[:3] == [5, 3, 9]
     assert len(tokens) == 8
+
+
+@pytest.mark.parametrize("cfg_coef", [1.0, 2.0])
+def test_generate_does_not_emit_condition_diagnostics_or_synchronize(
+    tiny_model, monkeypatch, capsys, cfg_coef
+):
+    monkeypatch.setattr(
+        muscriptor.accelerator,
+        "synchronize",
+        lambda: pytest.fail(
+            "condition generation must not synchronize for diagnostics"
+        ),
+    )
+
+    list(
+        tiny_model.generate(
+            conditions=[ConditioningAttributes()],
+            max_gen_len=2,
+            num_samples=1,
+            use_sampling=False,
+            cfg_coef=cfg_coef,
+        )
+    )
+    assert capsys.readouterr() == ("", "")
 
 
 def test_generate_with_own_greedy_prefix_as_prompt_is_a_noop(tiny_model):

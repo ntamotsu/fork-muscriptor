@@ -87,8 +87,8 @@ def transcribe(
             "--output",
             "-o",
             help=(
-                "Output file path. Use '-' to write to stdout (all progress / "
-                "timing info is sent to stderr in that case). "
+                "Output file path. Use '-' to write to stdout (all progress "
+                "and diagnostics are sent to stderr in that case). "
                 "Default: <audio_file>.<ext> where ext matches --format. "
                 "With --format sheets this is a directory instead: it must be "
                 "empty or not exist yet, and is created if missing."
@@ -300,7 +300,7 @@ def transcribe(
 
     _device = None if device == "auto" else device
 
-    # All chatty progress/timing info goes to stderr — stdout is reserved for
+    # All progress and diagnostics go to stderr — stdout is reserved for
     # the actual output when `-o -` is used.
     typer.echo("Loading model…", err=True)
     model = _load_model(model_path, _device, dtype)

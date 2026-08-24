@@ -12,11 +12,46 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import muscriptor.accelerator
 from muscriptor.events import ChunkBoundary, ProgressEvent
 from muscriptor.transcription_model import TranscriptionModel
 from muscriptor.utils.beats import BeatDetectionError
 
 EOS = 99
+
+
+class _MinimalTranscriber:
+    """Public transcription entry point backed by deterministic test doubles."""
+
+    transcribe = TranscriptionModel.transcribe
+    _device = torch.device("cpu")
+    _tokenizer = SimpleNamespace(_vocab=[], frame_rate=100)
+    _instrument_for_program = staticmethod(lambda _program: "piano")
+    _resolve_batch_size = staticmethod(lambda _batch_size, _prelude_forcing: 1)
+    _load_wav = staticmethod(lambda tensor, _sample_rate: tensor)
+    _build_conditions = staticmethod(lambda _chunk, _instrument_group: [object()])
+    _generate_token_stream = staticmethod(lambda *_args, **_kwargs: iter(()))
+
+
+def test_transcribe_keeps_progress_without_timing_side_effects(monkeypatch, capsys):
+    monkeypatch.setattr(
+        muscriptor.accelerator,
+        "synchronize",
+        lambda: pytest.fail("transcription must not synchronize for diagnostics"),
+    )
+
+    events = list(_MinimalTranscriber().transcribe((torch.zeros(1, 100), 16_000)))
+    captured = capsys.readouterr()
+
+    assert (
+        events,
+        captured.out,
+        captured.err.splitlines(),
+    ) == (
+        [ProgressEvent(completed=0, total=1)],
+        "",
+        ["[muscriptor] audio: 0.0s → 1 chunk(s) of 5.0s"],
+    )
 
 
 def _run(batches, *, batch_size, seek_times, no_eos_is_ok=False):
